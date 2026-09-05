@@ -1,24 +1,39 @@
 import { OnenotePage, SectionGroup, User, PublicError, Notebook, OnenoteSection } from '@microsoft/microsoft-graph-types';
-import { DataWriteOptions, Notice, Setting, TFolder, htmlToMarkdown, ObsidianProtocolData, requestUrl, moment } from 'obsidian';
-import { genUid, extractErrorMessage, parseHTML } from '../util';
-import { FormatImporter } from '../format-importer';
-import { ATTACHMENT_EXTS, AUTH_REDIRECT_URI, ImportContext } from '../main';
+import { ButtonComponent, DataWriteOptions, normalizePath, Notice, Setting, TFile, TFolder, ObsidianProtocolData, requestUrl, moment } from 'obsidian';
+import { genUid, extractErrorMessage, parseHTML, sameBytes, sanitizeFileName } from '../util';
+import { DuplicateHandling, FormatImporter, NoteTemplateSample, TEMPLATE_PREVIEW_LIMIT } from '../format-importer';
+import { selectedNodes } from '../tree';
+import { TreePicker, ViewableNode } from '../tree-view';
+import { ATTACHMENT_EXTS, AUTH_REDIRECT_URI } from '../constants';
+import { ImportContext } from '../import-context';
+import { i18n } from '../i18n';
 import { AccessTokenResponse } from './onenote/models';
-import { getSiblingsInSameCodeBlock, isFenceCodeBlock, isInlineCodeSpan, isBRElement, isParagraphWrappingOnlyCode } from './onenote/code';
+import { convertPageTags, pageToMarkdown } from './onenote/convert';
+import { describeNotebookFailure, SCOPE_REFUSED, THROTTLED } from './onenote/errors';
+import { requestFailure } from '../request-failure';
+import { accountTypeFromToken, authorizationUrl, graphScopes, storedAccountType, TOKEN_URL } from './onenote/auth';
+import type { MicrosoftAccountType } from './onenote/auth';
 import { inkmlToSvg } from './onenote/inkml';
-import { MathMLToLaTeX } from 'mathml-to-latex';
+import { parseFilePath, splitext } from '../filesystem';
+import { extensionForMime } from '../mime';
 
-const LOCAL_STORAGE_KEY = 'onenote-importer-refresh-token';
+const ACCOUNT_SECRET_ID = 'onenote-importer';
+const PREVIOUS_SECRET_ID = 'onenote-importer-refresh-token';
+const ACCOUNT_TYPE_STORAGE_KEY = 'onenote-importer-account-type';
+function signedOutHint(): string {
+	return i18n.importer.onenote.msgSignedOut();
+}
 const GRAPH_CLIENT_ID: string = '66553851-08fa-44f2-8bb1-1436f121a73d';
-const GRAPH_SCOPES: string[] = ['user.read', 'notes.read'];
 // Regex for fixing broken HTML returned by the OneNote API
 const SELF_CLOSING_REGEX = /<(object|iframe)([^>]*)\/>/g;
-// Regex for fixing whitespace and paragraphs
-const PARAGRAPH_REGEX = /(<\/p>)\s*(<p[^>]*>)|\n  \n/g;
 // Maximum amount of request retries, before they're marked as failed. Does not include 429 backoff errors.
 const MAX_RETRY_ATTEMPTS = 5;
+// Increase spacing after throttling and reduce it after successful downloads.
+const ATTACHMENT_SPACING_STEP_MS = 500;
+const MAX_ATTACHMENT_SPACING_MS = 3_000;
 
-const BASE64_REGEX = new RegExp(/^data:[\w\d]+\/[\w\d]+;base64,/);
+// Microsoft Graph caps page requests at 100.
+const PAGES_PER_REQUEST = 100;
 
 type JSONWrappedResponse<T> = {
 	value: T[];
@@ -27,8 +42,72 @@ type JSONWrappedResponse<T> = {
 	value: T[];
 };
 
+type ResourceType = 'text' | 'file' | 'json' | 'json-wrapped';
+
+type FetchedResource<T> = string | ArrayBuffer | object | JSONWrappedResponse<T>;
+
+function resourceId(contentLocation: string): string {
+	try {
+		const parts = new URL(contentLocation).pathname.split('/');
+		const resources = parts.lastIndexOf('resources');
+		return resources >= 0 && parts[resources + 1]
+			? decodeURIComponent(parts[resources + 1])
+			: contentLocation;
+	}
+	catch {
+		return contentLocation;
+	}
+}
+
+async function resourceKey(contentLocation: string): Promise<string> {
+	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(resourceId(contentLocation)));
+	return Array.from(new Uint8Array(digest).slice(0, 8), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function resourceFilename(filename: string, contentLocation: string): Promise<string> {
+	const { basename, extension } = parseFilePath(filename);
+	return `${basename} ${await resourceKey(contentLocation)}${extension ? `.${extension}` : ''}`;
+}
+
 function assertUnreachable(x: never): never {
 	throw new Error(`Didn't expect to get here`);
+}
+
+export function findingNotes(title: string, index: number, sections: number): string {
+	return sections > 1
+		? i18n.importer.onenote.statusFindingInSection({ section: title, index: index + 1, total: sections })
+		: i18n.importer.onenote.statusFindingIn({ section: title });
+}
+
+/**
+ * A failure caused by one page's content rather than the import environment.
+ * Only these are kept out of the consecutive-failure stop, which exists to
+ * catch whatever is about to fail every remaining page the same way.
+ */
+class PageContentError extends Error {
+	constructor(cause: unknown) {
+		super(extractErrorMessage(cause) ?? String(cause));
+	}
+
+	static wrapping<T>(convert: () => T): T {
+		try {
+			return convert();
+		}
+		catch (e) {
+			throw new PageContentError(e);
+		}
+	}
+}
+
+class GraphRefusal extends Error {
+	readonly status: number;
+	readonly code?: string;
+
+	constructor(status: number, err: PublicError | null) {
+		super(err?.message || `OneNote returned ${status}`);
+		this.status = status;
+		this.code = err?.code ?? undefined;
+	}
 }
 
 function assertJSONWrappedResponse<T>(res: unknown): asserts res is JSONWrappedResponse<T> {
@@ -56,126 +135,152 @@ function assertJSONWrappedResponse<T>(res: unknown): asserts res is JSONWrappedR
 	}
 }
 
-function isHTMLElement(node: Node): node is HTMLElement {
-	return node instanceof HTMLElement;
+interface OneNoteTreeNode extends ViewableNode<OneNoteTreeNode> {
+	id: string;
+	type: 'notebook' | 'group' | 'section';
+	collapsed: boolean;
+	children: OneNoteTreeNode[];
+}
+
+interface PreviewContentRead {
+	request: Promise<string>;
+	background: boolean;
 }
 
 export class OneNoteImporter extends FormatImporter {
+	interruption = 'pause' as const;
+
 	// Settings
-	importPreviouslyImported: boolean = false;
 	importIncompatibleAttachments: boolean = false;
 	// UI
-	microsoftAccountSetting: Setting;
-	switchUserSetting: Setting;
-	loadingArea: HTMLDivElement;
-	contentArea: HTMLDivElement;
+	accountSetting: Setting;
+	private accountButton: ButtonComponent;
+	private organizationButton?: ButtonComponent;
+	private picker: TreePicker<OneNoteTreeNode>;
 	// Internal
-	selectedIds: string[] = [];
+	selectedSections: OneNoteTreeNode[] = [];
 	notebooks: Notebook[] = [];
 	graphData = {
 		state: genUid(32),
 		accessToken: '',
 	};
-	attachmentDownloadPauseCounter = 0;
-	rememberMe = false;
+	private throttleSpacingMs = 0;
+	private readonly sectionPages = new Map<string, OnenotePage[]>();
+	private readonly readingAhead = new Map<string, Promise<void>>();
+	private readAheadQueue: Promise<void> = Promise.resolve();
+	private readonly previewContentReads = new Map<string, PreviewContentRead>();
+	private previewReadAhead: Promise<void> = Promise.resolve();
+	/** Bumped to disown reads that were started against an earlier listing. */
+	private pagesGeneration = 0;
+	private authenticatingAccountType: MicrosoftAccountType | null = null;
+	private attachmentPaths!: Map<string, string>;
+	private attachmentOwners!: Map<string, string>;
+	private attachmentPathsChanged!: boolean;
 	refreshToken?: string;
 	lastSuccessfulFetchTime: number = performance.now();
 
-	async init() {
-		this.addOutputLocationSetting('OneNote');
+	private get signedIn(): boolean {
+		return this.graphData.accessToken !== '';
+	}
 
-		new Setting(this.modal.contentEl)
-			.setName('Import incompatible attachments')
-			.setDesc('Imports incompatible attachments which cannot be embedded in Obsidian, such as .exe files.')
+	get sourceReady(): boolean {
+		return this.selectedSections.length > 0;
+	}
+
+	private get microsoftAccountType(): MicrosoftAccountType | null {
+		return storedAccountType(this.app.loadLocalStorage(ACCOUNT_TYPE_STORAGE_KEY));
+	}
+
+	private set microsoftAccountType(value: MicrosoftAccountType | null) {
+		this.app.saveLocalStorage(ACCOUNT_TYPE_STORAGE_KEY, value);
+	}
+
+	async init() {
+		this.attachmentPaths = new Map();
+		this.attachmentOwners = new Map();
+		this.attachmentPathsChanged = false;
+
+		if (this.host.plugin) {
+			const data = await this.host.plugin.loadData();
+			for (const [key, path] of Object.entries(data.onenoteAttachments ?? {})) {
+				const file = this.vault.getAbstractFileByPath(path);
+				const resource = this.attachmentResource(key);
+				const owner = file instanceof TFile ? this.attachmentOwner(file.path) : null;
+				if (!(file instanceof TFile) || (owner !== null && owner !== resource)) {
+					this.attachmentPathsChanged = true;
+					continue;
+				}
+
+				this.attachmentPaths.set(key, file.path);
+				this.attachmentOwners.set(this.attachmentPathKey(file.path), resource);
+			}
+		}
+
+		this.defaultOutputFolder = 'OneNote';
+		this.idProperty = 'onenote-id';
+		this.idLabel = i18n.importer.onenote.labelId();
+
+		this.addSetting()
+			?.setName(i18n.importer.onenote.nameIncompatible())
+			.setDesc(i18n.importer.onenote.descIncompatible())
 			.addToggle((toggle) => toggle
 				.setValue(false)
 				.onChange((value) => (this.importIncompatibleAttachments = value))
 			);
 
-		new Setting(this.modal.contentEl)
-			.setName('Skip previously imported')
-			.setDesc('If enabled, notes imported previously by this plugin will be skipped.')
-			.addToggle((toggle) => toggle
-				.setValue(true)
-				.onChange((value) => (this.importPreviouslyImported = !value))
-			);
-
-		let authenticated = false;
-		if (this.retrieveRefreshToken()) {
-			try {
-				await this.updateAccessToken();
-				authenticated = true;
-			}
-			catch {
-				// Failed to auth with refresh token. Proceed with normal sign in flow.
-			}
+		const contentEl = this.host.sourceEl;
+		if (!contentEl) {
+			await this.signInWithStoredToken();
+			return;
 		}
 
-		this.microsoftAccountSetting =
-			new Setting(this.modal.contentEl)
-				.setName('Sign in with your Microsoft account')
-				.setDesc('You need to sign in to import your OneNote data.')
-				.addButton((button) => button
-					.setCta()
-					.setButtonText('Sign in')
+		this.accountSetting = new Setting(this.settingsIn(contentEl))
+			.setName(i18n.importer.onenote.nameAccount());
+
+		this.accountSetting
+			.addButton(button => {
+				this.organizationButton = button;
+				button
+					.setButtonText(i18n.importer.onenote.buttonWorkAccount())
 					.onClick(() => {
-						this.registerAuthCallback(this.authenticateUser.bind(this));
-
-						const requestBody = new URLSearchParams({
-							client_id: GRAPH_CLIENT_ID,
-							scope: 'offline_access ' + GRAPH_SCOPES.join(' '),
-							response_type: 'code',
-							redirect_uri: AUTH_REDIRECT_URI,
-							response_mode: 'query',
-							state: this.graphData.state,
-						});
-						window.open(`https://login.microsoftonline.com/common/oauth2/v2.0/authorize?${requestBody.toString()}`);
-					})
-				);
-		this.microsoftAccountSetting.settingEl.toggle(!authenticated);
-
-		const rememberMeSetting = new Setting(this.modal.contentEl)
-			.setName('Remember me')
-			.setDesc('If checked, you will be automatically logged in for subsequent imports.')
-			.addToggle((toggle) => {
-				toggle.onChange((value) => {
-					this.rememberMe = value;
-					if (value && this.refreshToken) {
-						this.storeRefreshToken(this.refreshToken);
-					}
-					else {
-						this.clearStoredRefreshToken();
-					}
+						this.signOut();
+						this.signIn('organization');
+					});
+				button.buttonEl.hide();
+			})
+			.addButton((button) => {
+				this.accountButton = button;
+				button.onClick(() => {
+					if (this.signedIn) this.signOut();
+					else this.signIn();
 				});
 			});
-		rememberMeSetting.settingEl.toggle(!authenticated);
 
-		this.switchUserSetting = new Setting(this.modal.contentEl)
-			.addButton((button) => button
-				.setCta()
-				.setButtonText('Switch user')
-				.onClick(() => {
-					this.microsoftAccountSetting.settingEl.show();
-					rememberMeSetting.settingEl.show();
-					this.clearStoredRefreshToken();
-					this.switchUserSetting.settingEl.hide();
-					this.contentArea.empty();
-				})
-			);
+		this.drawSectionPicker(contentEl);
 
-		this.loadingArea = this.modal.contentEl.createDiv({
-			text: 'Loading notebooks...',
-		});
-		this.loadingArea.hide();
-		this.contentArea = this.modal.contentEl.createDiv();
-		this.contentArea.hide();
+		this.showSignedOut();
 
-		if (authenticated) {
-			await this.setSwitchUser();
+		if (await this.signInWithStoredToken()) {
+			await this.showSignedIn();
 			await this.showSectionPickerUI();
 		}
-		else {
-			this.switchUserSetting.settingEl.hide();
+	}
+
+	private async signInWithStoredToken(): Promise<boolean> {
+		if (!this.retrieveRefreshToken()) return false;
+
+		try {
+			await this.updateAccessToken();
+			return true;
+		}
+		catch (error) {
+			const { status, code } = requestFailure(error);
+			if (status === 400 || status === 401 || code === 'invalid_grant') {
+				this.clearStoredRefreshToken();
+				this.refreshToken = undefined;
+				this.microsoftAccountType = null;
+			}
+			return false;
 		}
 	}
 
@@ -186,25 +291,71 @@ export class OneNoteImporter extends FormatImporter {
 			}
 
 			await this.updateAccessToken(protocolData['code']);
-			await this.setSwitchUser();
+			await this.showSignedIn();
 			await this.showSectionPickerUI();
 		}
 		catch (e) {
+			this.authenticatingAccountType = null;
 			console.error('An error occurred while we were trying to sign you in. Error details: ', e);
-			this.modal.contentEl.createEl('div', { text: 'An error occurred while trying to sign you in.' })
+			this.host.sourceEl?.createDiv({ text: i18n.importer.onenote.msgSignInFailed() })
 				.createEl('details', { text: String(e) })
-				.createEl('summary', { text: 'Click here to show error details' });
+				.createEl('summary', { text: i18n.importer.onenote.msgSignInDetails() });
 		}
 	}
 
-	async setSwitchUser() {
-		const userData = await this.fetchResource<User>('https://graph.microsoft.com/v1.0/me', 'json');
-		this.switchUserSetting.setDesc(
-			`Signed in as ${userData.displayName} (${userData.mail}). If that's not the correct account, sign in again.`
-		);
+	private showSignedOut() {
+		this.organizationButton?.buttonEl.hide();
+		this.accountSetting.setDesc(this.microsoftAccountType === 'organization'
+			? i18n.importer.onenote.descSignInOrganization()
+			: i18n.importer.onenote.descSignIn());
+		this.accountButton.setButtonText(i18n.importer.onenote.buttonSignIn()).setCta();
+		this.accountButton.buttonEl.removeClass('mod-destructive');
+	}
 
-		this.switchUserSetting.settingEl.show();
-		this.microsoftAccountSetting.settingEl.hide();
+	async showSignedIn() {
+		this.organizationButton?.buttonEl.hide();
+		const userData = await this.fetchResource<User>('https://graph.microsoft.com/v1.0/me', 'json');
+		this.accountSetting.setDesc(i18n.importer.onenote.descSignedIn({
+			name: String(userData.displayName),
+			email: String(userData.mail),
+		}));
+		this.accountButton.setButtonText(i18n.importer.onenote.buttonSignOut()).removeCta();
+
+		this.accountButton.buttonEl.addClass('mod-destructive');
+	}
+
+	private signIn(accountType: MicrosoftAccountType = this.microsoftAccountType ?? 'personal') {
+		this.registerAuthCallback(data => void this.authenticateUser(data)
+			.catch(e => console.error('Could not complete sign in', e)));
+		this.authenticatingAccountType = accountType;
+
+		// '_external' keeps this out of the Web Viewer, whose webview refuses to
+		// navigate anywhere but http(s) — the obsidian:// redirect Microsoft ends
+		// on would be dropped there, and sign in would stall with nothing said.
+		window.open(authorizationUrl(
+			this.authenticatingAccountType,
+			GRAPH_CLIENT_ID,
+			AUTH_REDIRECT_URI,
+			this.graphData.state,
+		), '_external');
+	}
+
+	private signOut() {
+		this.clearStoredRefreshToken();
+
+		this.graphData.accessToken = '';
+		this.refreshToken = undefined;
+		this.authenticatingAccountType = null;
+
+		// Whoever signs in next is not necessarily who these belong to, and
+		// asking a personal account for the scopes an organization needs is
+		// refused before a token comes back to say which kind it was.
+		this.microsoftAccountType = null;
+		this.forgetSectionPages();
+
+		this.picker.reset();
+
+		this.showSignedOut();
 	}
 
 	/**
@@ -216,7 +367,9 @@ export class OneNoteImporter extends FormatImporter {
 		// used if this import takes a long time, or for future imports.
 		const requestBody = new URLSearchParams({
 			client_id: GRAPH_CLIENT_ID,
-			scope: 'offline_access ' + GRAPH_SCOPES.join(' '),
+			scope: 'offline_access ' + graphScopes(
+				code ? this.authenticatingAccountType ?? 'personal' : this.microsoftAccountType ?? 'personal'
+			).join(' '),
 			redirect_uri: AUTH_REDIRECT_URI,
 		});
 		if (code) {
@@ -234,46 +387,84 @@ export class OneNoteImporter extends FormatImporter {
 
 		const tokenResponse: AccessTokenResponse = await requestUrl({
 			method: 'POST',
-			url: 'https://login.microsoftonline.com/common/oauth2/v2.0/token',
+			url: TOKEN_URL,
 			contentType: 'application/x-www-form-urlencoded',
 			body: requestBody.toString(),
 		}).json;
 
 		if (!tokenResponse.access_token) {
-			throw new Error(`Unexpected data was returned instead of an access token. Error details: ${tokenResponse}`);
+			throw new Error(`Unexpected data was returned instead of an access token. Error details: ${JSON.stringify(tokenResponse)}`);
 		}
 
 		if (tokenResponse.refresh_token) {
 			this.storeRefreshToken(tokenResponse.refresh_token);
 		}
 
+		const detected = accountTypeFromToken(tokenResponse.id_token ?? tokenResponse.access_token);
+		if (detected) this.microsoftAccountType = detected;
+		this.authenticatingAccountType = null;
+
 		this.graphData.accessToken = tokenResponse.access_token;
+		this.sourceChanged();
 	}
 
 	private storeRefreshToken(refreshToken: string) {
 		this.refreshToken = refreshToken;
-		if (this.rememberMe) {
-			localStorage.setItem(LOCAL_STORAGE_KEY, refreshToken);
-		}
+		this.app.secretStorage.setSecret(ACCOUNT_SECRET_ID, refreshToken);
 	}
 
 	private retrieveRefreshToken(): string | null {
 		if (this.refreshToken) {
 			return this.refreshToken;
 		}
-		return localStorage.getItem(LOCAL_STORAGE_KEY);
+
+		const stored = this.app.secretStorage.getSecret(ACCOUNT_SECRET_ID);
+		if (stored) return stored;
+
+		const previous = this.app.secretStorage.getSecret(PREVIOUS_SECRET_ID);
+		if (previous) {
+			this.app.secretStorage.setSecret(ACCOUNT_SECRET_ID, previous);
+			this.app.secretStorage.deleteSecret(PREVIOUS_SECRET_ID);
+		}
+
+		return previous;
 	}
 
 	private clearStoredRefreshToken() {
-		localStorage.removeItem(LOCAL_STORAGE_KEY);
+		this.app.secretStorage.deleteSecret(ACCOUNT_SECRET_ID);
+	}
+	/** Page lists read against an earlier listing no longer describe the source. */
+	private forgetSectionPages(): void {
+		this.pagesGeneration++;
+		this.sectionPages.clear();
+		this.readingAhead.clear();
+		this.previewContentReads.clear();
 	}
 
-	async showSectionPickerUI() {
-		this.loadingArea.show();
+	async showSectionPickerUI(): Promise<void> {
+		if (!this.signedIn) {
+			new Notice(signedOutHint());
+			return;
+		}
 
-		// Emptying, as the user may have leftover selections from previous sign-in attempt
-		this.selectedIds = [];
+		// Reloading the notebooks is the user asking to be told again.
+		this.forgetSectionPages();
 
+		try {
+			await this.picker.load(() => this.readNotebooks());
+		}
+		catch (e) {
+			// Personal accounts cannot consent to Notes.Read.All, so escalating
+			// one leaves it unable to sign in at all.
+			if (requestFailure(e).code === SCOPE_REFUSED && this.microsoftAccountType !== 'personal') {
+				this.organizationButton?.buttonEl.show();
+			}
+
+			console.error('An error occurred while fetching your OneNote data: ', e);
+		}
+	}
+
+	private async readNotebooks(): Promise<OneNoteTreeNode[]> {
 		const baseUrl = 'https://graph.microsoft.com/v1.0/me/onenote/notebooks';
 
 		// Fetch the sections & section groups directly under the notebook
@@ -282,48 +473,57 @@ export class OneNoteImporter extends FormatImporter {
 			$select: 'id,displayName,lastModifiedDateTime',
 			$orderby: 'lastModifiedDateTime DESC',
 		});
-		const sectionsUrl = `${baseUrl}?${params.toString()}`;
-		try {
-			this.notebooks = (await this.fetchResource<Notebook>(sectionsUrl, 'json-wrapped')).value;
 
-			// Make sure the element is empty, in case the user signs in twice
-			this.contentArea.empty();
-			this.contentArea.createEl('h4', {
-				text: 'Choose data to import',
-			});
+		this.notebooks = (await this.fetchResource<Notebook>(`${baseUrl}?${params.toString()}`, 'json-wrapped')).value;
 
-			for (const notebook of this.notebooks) {
-				// Check if there are any nested section groups, if so, fetch them
-				if (notebook.sectionGroups?.length !== 0) {
-					for (const sectionGroup of notebook.sectionGroups!) {
-						await this.fetchNestedSectionGroups(sectionGroup);
-					}
+		for (const notebook of this.notebooks) {
+			if (notebook.sectionGroups?.length !== 0) {
+				for (const sectionGroup of notebook.sectionGroups!) {
+					await this.fetchNestedSectionGroups(sectionGroup);
 				}
-
-				let notebookDiv = this.contentArea.createDiv();
-
-				new Setting(notebookDiv)
-					.setName(notebook.displayName!)
-					.setDesc(`Last edited on: ${(moment.utc(notebook.lastModifiedDateTime)).format('Do MMMM YYYY')}. Contains ${notebook.sections?.length} sections.`)
-					.addButton((button) => button
-						.setCta()
-						.setButtonText('Select all')
-						.onClick(() => {
-							notebookDiv.querySelectorAll<HTMLInputElement>('input[type="checkbox"]:not(:checked)').forEach((el) => el.click());
-						}));
-				this.renderHierarchy(notebook, notebookDiv);
 			}
 		}
-		catch (e) {
-			console.error('An error occurred while fetching your OneNote data: ', e);
-			this.showContentAreaErrorMessage();
-		}
 
-		this.loadingArea.hide();
-		this.contentArea.show();
+		return this.notebooks.map(notebook => this.treeNode(
+			notebook.id!, notebook.displayName!, 'notebook', this.childNodes(notebook)
+		));
 	}
 
-	// Gets the content of a nested section group
+	private drawSectionPicker(contentEl: HTMLElement): void {
+		this.picker = new TreePicker<OneNoteTreeNode>(contentEl, {
+			setting: this.addSetting('source'),
+			name: i18n.importer.onenote.nameSections(),
+			desc: i18n.importer.onenote.descSections(),
+			hint: signedOutHint(),
+			loading: i18n.importer.onenote.msgLoadingNotebooks(),
+			empty: i18n.importer.onenote.msgNoNotebooks(),
+			failed: describeNotebookFailure,
+			view: {
+				icon: node => node.type === 'notebook' ? 'book' : node.type === 'group' ? 'folder' : 'file',
+			},
+			onChange: () => {
+				this.selectedSections = selectedNodes(this.picker.nodes, node => node.type === 'section');
+				this.prefetchSelectedPages();
+				this.sourceChanged();
+			},
+		});
+
+		this.picker.onLoad(() => void this.showSectionPickerUI());
+	}
+
+	private treeNode(id: string, title: string, type: OneNoteTreeNode['type'], children: OneNoteTreeNode[]): OneNoteTreeNode {
+		return { id, title, type, selected: false, disabled: false, collapsed: false, children };
+	}
+
+	private childNodes(entity: Notebook | SectionGroup): OneNoteTreeNode[] {
+		const groups = (entity.sectionGroups ?? []).map(group =>
+			this.treeNode(group.id!, group.displayName!, 'group', this.childNodes(group)));
+
+		const sections = (entity.sections ?? []).map(section =>
+			this.treeNode(section.id!, section.displayName!, 'section', []));
+
+		return [...groups, ...sections];
+	}
 	async fetchNestedSectionGroups(parentGroup: SectionGroup) {
 		parentGroup.sectionGroups = (await this.fetchResource<SectionGroup>(parentGroup.sectionGroupsUrl + '?$expand=sectionGroups($expand=sections),sections', 'json-wrapped')).value;
 
@@ -334,182 +534,291 @@ export class OneNoteImporter extends FormatImporter {
 		}
 	}
 
-	// Renders a HTML list of all section groups and sections
-	renderHierarchy(entity: SectionGroup | Notebook, parentEl: HTMLElement) {
-		if (entity.sectionGroups) {
-			for (const sectionGroup of entity.sectionGroups) {
-				let sectionGroupDiv = parentEl.createDiv(
-					{
-						attr: {
-							style: 'padding-inline-start: 1em; padding-top: 8px'
-						}
-					});
+	override prefetchTemplatePreview(): void {
+		if (!this.signedIn) return;
 
-				sectionGroupDiv.createEl('strong', {
-					text: sectionGroup.displayName!,
-				});
+		const generation = this.pagesGeneration;
+		this.previewReadAhead = this.readPreviewPages(generation)
+			.then(async pages => {
+				for (const page of pages) {
+					if (generation !== this.pagesGeneration) return;
+					try {
+						await this.previewPageContent(page);
+					}
+					catch {
+						// Retry later with the visible preview's rate-limit handling.
+					}
+				}
+			})
+			.catch(error => console.warn('Could not read OneNote previews ahead of time', error));
+	}
 
-				this.renderHierarchy(sectionGroup, sectionGroupDiv);
+	private async readPreviewPages(generation: number): Promise<OnenotePage[]> {
+		const queue: OnenotePage[] = [];
+		const sections = [...this.selectedSections];
+
+		for (const section of sections) {
+			if (generation !== this.pagesGeneration) break;
+
+			await this.readingAhead.get(section.id);
+			if (generation !== this.pagesGeneration) break;
+
+			let pages = this.sectionPages.get(section.id);
+			if (!pages) {
+				try {
+					pages = await this.fetchSectionPages(section.id);
+					if (generation === this.pagesGeneration) this.sectionPages.set(section.id, pages);
+				}
+				catch {
+					continue;
+				}
 			}
+
+			this.insertPagesToSection(pages, section.id);
+			queue.push(...pages.slice(0, TEMPLATE_PREVIEW_LIMIT - queue.length));
+			if (queue.length >= TEMPLATE_PREVIEW_LIMIT) break;
 		}
 
-		if (entity.sections) {
-			const sectionList = parentEl.createEl('ul', {
-				attr: {
-					style: 'padding-inline-start: 1em;',
-				},
-			});
-			for (const section of entity.sections) {
-				const listElement = sectionList.createEl('li', {
-					cls: 'task-list-item',
-				});
-				let label = listElement.createEl('label');
-				let checkbox = label.createEl('input');
-				checkbox.type = 'checkbox';
+		return queue;
+	}
 
-				label.appendChild(document.createTextNode(section.displayName!));
-				label.createEl('br');
+	private startPreviewPageContent(pageId: string, progress?: ImportContext): PreviewContentRead {
+		const read: PreviewContentRead = {
+			request: this.fetchResource(
+				`https://graph.microsoft.com/v1.0/me/onenote/pages/${pageId}/content?includeInkML=true`,
+				'text',
+				progress,
+			),
+			background: progress === undefined,
+		};
+		this.previewContentReads.set(pageId, read);
+		void read.request.catch(() => {
+			if (this.previewContentReads.get(pageId) === read) this.previewContentReads.delete(pageId);
+		});
+		return read;
+	}
 
-				checkbox.addEventListener('change', () => {
-					if (checkbox.checked) this.selectedIds.push(section.id!);
-					else {
-						const index = this.selectedIds.findIndex((sec) => sec === section.id);
-						if (index !== -1) {
-							this.selectedIds.splice(index, 1);
-						}
-					}
-				});
-			}
+	private async previewPageContent(page: OnenotePage, progress?: ImportContext): Promise<string> {
+		if (!page.id) throw new Error('OneNote returned a page without an ID');
+
+		const existing = this.previewContentReads.get(page.id);
+		if (!existing) return await this.startPreviewPageContent(page.id, progress).request;
+
+		try {
+			return await existing.request;
+		}
+		catch (error) {
+			// Background reads skip Graph throttling delays; visible previews retry them.
+			if (!progress || !existing.background) throw error;
+			return await this.startPreviewPageContent(page.id, progress).request;
 		}
 	}
 
-	showContentAreaErrorMessage() {
-		this.contentArea.empty();
-		this.contentArea.createEl('p', {
-			text: 'Microsoft OneNote has limited how fast notes can be imported. Please try again in 1 hour to continue importing.'
-		});
+	protected override async templatePreviewSamples(ctx: ImportContext): Promise<NoteTemplateSample[]> {
+		const samples: NoteTemplateSample[] = [];
+		if (!this.graphData.accessToken) return samples;
 
-		this.contentArea.show();
-		this.loadingArea.hide();
+		const pages = await this.readPreviewPages(this.pagesGeneration);
+		for (const page of pages) {
+			if (await ctx.shouldStop()) break;
+			const title = page.title?.trim() || 'Untitled';
+			try {
+				const response = await this.previewPageContent(page, ctx);
+				const split = PageContentError.wrapping(() => this.convertFormat(response));
+				const pageElement = parseHTML(
+					convertPageTags(split.html).replace(SELF_CLOSING_REGEX, '<$1$2></$1>'),
+				);
+				for (const object of pageElement.findAll('object')) {
+					const name = object.getAttribute('data-attachment');
+					object.replaceWith(pageElement.doc.createTextNode(name ? `(attachment: ${name})` : '(attachment)'));
+				}
+				for (const image of pageElement.findAll('img')) {
+					image.replaceWith(pageElement.doc.createTextNode('(image)'));
+				}
+				const parent = page.id
+					? this.getEntityPathNoParent(page.id, this.outputLocation) ?? this.outputLocation
+					: this.outputLocation;
+				const ctime = page.createdDateTime ? Date.parse(page.createdDateTime) : NaN;
+				const mtime = page.lastModifiedDateTime ? Date.parse(page.lastModifiedDateTime) : NaN;
+				samples.push({
+					title,
+					path: normalizePath(`${parent}/${sanitizeFileName(title)}.md`),
+					content: PageContentError.wrapping(() => pageToMarkdown(pageElement)),
+					sourceId: page.id ?? undefined,
+					times: {
+						ctime: Number.isNaN(ctime) ? undefined : ctime,
+						mtime: Number.isNaN(mtime) ? undefined : mtime,
+					},
+				});
+			}
+			catch (error) {
+				console.warn(`Could not preview OneNote page ${title}`, error);
+			}
+		}
+		return samples;
 	}
 
 	async import(progress: ImportContext): Promise<void> {
-		const previouslyImported = new Set<string>();
-		const data = await this.modal.plugin.loadData();
-		if (!data.importers.onenote) {
-			data.importers.onenote = {
-				previouslyImportedIDs: [],
-			};
-		}
-		for (const id of data.importers.onenote.previouslyImportedIDs) {
-			previouslyImported.add(id);
-		}
-
 		const outputFolder = await this.getOutputFolder();
 		if (!outputFolder) {
-			new Notice('Please select a location to export to.');
+			new Notice(i18n.common.msgPickOutput());
 			return;
 		}
 
 		if (!this.graphData.accessToken) {
-			new Notice('Please sign in to your Microsoft Account.');
+			new Notice(i18n.importer.onenote.msgPleaseSignIn());
 			return;
 		}
 
-		progress.status('Starting OneNote import');
-		let progressTotal = 0;
+		progress.status(i18n.importer.onenote.statusFinding());
+		const queue = await this.readSelectedPages(progress);
+		if (await progress.shouldStop()) return;
+
+		const progressTotal = queue.length;
+		progress.status(i18n.importer.onenote.statusImportingNotes({
+			notes: i18n.nouns.noteWithCount({ count: progressTotal }),
+		}));
 		let progressCurrent = 0;
 		let consecutiveFailureCount = 0;
 
-		for (let sectionId of this.selectedIds) {
-			const baseUrl = `https://graph.microsoft.com/v1.0/me/onenote/sections/${sectionId}/pages`;
+		progress.reportProgress(0, progressTotal);
+
+		for (let i = 0; i < queue.length; i++) {
+			if (await progress.shouldStop()) {
+				return;
+			}
+
+			const page = queue[i];
+			if (!page.title) page.title = `Untitled-${moment().format('YYYYMMDDHHmmss')}`;
+
+			progress.status(i18n.common.statusImportingNote({ name: page.title }));
+
+			try {
+				const content = await this.fetchResource(`https://graph.microsoft.com/v1.0/me/onenote/pages/${page.id}/content?includeInkML=true`, 'text', progress);
+				await this.processFile(progress, content, page);
+				consecutiveFailureCount = 0;
+			}
+			catch (e) {
+				progress.reportFailed(page.title, String(e));
+
+				// Page-specific failures do not indicate a broken import environment.
+				if (!(e instanceof PageContentError)
+					&& (++consecutiveFailureCount > 5 || this.host.abortController.signal.aborted)) {
+					progress.status(this.host.abortController.signal.aborted
+						? extractErrorMessage(e) ?? String(e)
+						: i18n.importer.onenote.msgTooManyErrors());
+
+					for (const remaining of queue.slice(i + 1)) {
+						progress.reportSkipped(
+							remaining.title ?? i18n.importer.onenote.labelUnknownPage(),
+							i18n.importer.onenote.reasonTooManyFailures()
+						);
+					}
+
+					progress.reportProgress(progressTotal, progressTotal);
+
+					return;
+				}
+			}
+
+			progress.reportProgress(++progressCurrent, progressTotal);
+		}
+	}
+	private async fetchSectionPages(sectionId: string, progress?: ImportContext): Promise<OnenotePage[]> {
+		const pages: OnenotePage[] = [];
+		const seen = new Set<string>();
+
+		// Setting $top disables @odata.nextLink, so paginate with $skip.
+		for (let skip = 0; ; skip += PAGES_PER_REQUEST) {
 			const params = new URLSearchParams({
 				$select: 'id,title,createdDateTime,lastModifiedDateTime,level,order,contentUrl',
 				$orderby: 'order',
-				pagelevel: 'true'
+				pagelevel: 'true',
+				$top: String(PAGES_PER_REQUEST),
+				$skip: String(skip),
 			});
 
-			const pagesUrl = `${baseUrl}?${params.toString()}`;
+			const url = `https://graph.microsoft.com/v1.0/me/onenote/sections/${sectionId}/pages?${params.toString()}`;
+			const batch = (await this.fetchResource<OnenotePage>(url, 'json-wrapped', progress)).value ?? [];
 
-			let pages: OnenotePage[] | null = null;
-			try {
-				pages = ((await this.fetchResource<OnenotePage>(pagesUrl, 'json-wrapped', progress)).value);
+			const fresh = batch.filter(page => !page.id || !seen.has(page.id));
+			for (const page of fresh) {
+				if (page.id) seen.add(page.id);
+				pages.push(page);
 			}
-			catch (e) {
-				console.error(`Failed to fetch pages for section ${sectionId}, skipping to next section.`, e);
-				progress.status('Failed to fetch pages for a section, skipping to next section.');
-				return;
-			}
-			if (!pages) {
-				continue;
-			}
-			progressTotal += pages.length;
-			this.insertPagesToSection(pages, sectionId);
 
-			progress.reportProgress(progressCurrent, progressTotal);
+			if (batch.length < PAGES_PER_REQUEST) return pages;
+			// Stop if Graph ignored $skip and repeated a full batch.
+			if (fresh.length === 0) return pages;
+		}
+	}
 
-			for (let i = 0; i < pages.length; i++) {
-				if (progress.isCancelled()) {
-					return;
-				}
+	/** Read selected page lists serially while the remaining settings are completed. */
+	private prefetchSelectedPages(): void {
+		if (!this.signedIn) return;
 
-				const page = pages[i];
-				if (!page.title) page.title = `Untitled-${moment().format('YYYYMMDDHHmmss')}`;
+		for (const section of this.selectedSections) {
+			if (this.sectionPages.has(section.id) || this.readingAhead.has(section.id)) continue;
 
-				if (!this.importPreviouslyImported && page.id && previouslyImported.has(page.id)) {
-					progress.reportSkipped(page.title, 'it was previously imported');
-					continue;
-				}
+			const generation = this.pagesGeneration;
+			const current = () => generation === this.pagesGeneration;
+
+			const reading = this.readAheadQueue.then(async () => {
+				// Recheck after earlier queued reads finish.
+				if (!current() || this.sectionPages.has(section.id)) return;
+				if (!this.selectedSections.some(selected => selected.id === section.id)) return;
 
 				try {
-					progress.status(`Importing note ${page.title}`);
+					const pages = await this.fetchSectionPages(section.id);
+					if (current()) this.sectionPages.set(section.id, pages);
+				}
+				catch {
+					// Let the import retry and report the failure.
+				}
+			});
 
-					await this.processFile(progress,
-						await this.fetchResource(`https://graph.microsoft.com/v1.0/me/onenote/pages/${page.id}/content?includeInkML=true`, 'text', progress),
-						page);
+			this.readAheadQueue = reading;
+			// A reload has already emptied the map; deleting would drop its entry.
+			this.readingAhead.set(section.id, reading.finally(() => {
+				if (current()) this.readingAhead.delete(section.id);
+			}));
+		}
+	}
 
-					if (page.id) {
-						previouslyImported.add(page.id);
-						data.importers.onenote.previouslyImportedIDs = Array.from(previouslyImported);
-						await this.modal.plugin.saveData(data);
-					}
+	/** Read every selected page list before importing so the total stays fixed. */
+	private async readSelectedPages(progress: ImportContext): Promise<OnenotePage[]> {
+		const queue: OnenotePage[] = [];
 
-					consecutiveFailureCount = 0;
+		const sections = this.selectedSections;
+		for (const [index, section] of sections.entries()) {
+			if (await progress.shouldStop()) break;
+
+			progress.status(findingNotes(section.title, index, sections.length));
+
+			await this.readingAhead.get(section.id);
+			let pages = this.sectionPages.get(section.id);
+
+			if (!pages) {
+				try {
+					pages = await this.fetchSectionPages(section.id, progress);
 				}
 				catch (e) {
-					consecutiveFailureCount++;
-					progress.reportFailed(page.title, String(e));
-
-					if (consecutiveFailureCount > 5 || this.modal.abortController.signal.aborted) {
-						const status = this.modal.abortController.signal.aborted
-							// The import was aborted
-							? extractErrorMessage(e) ?? String(e)
-							// Hit a string of consecutive failures, so something is
-							// wrong. This is NOT related to rate-limiting, as that
-							// is handled by the retry logic.
-							: 'Microsoft OneNote returned too many consecutive errors.';
-						progress.status(status);
-
-						// Report remaining pages as skipped
-						for (let j = i + 1; j < pages.length; j++) {
-							const remainingPage = pages[j];
-							progress.reportSkipped(
-								remainingPage.title ?? '<unknown>',
-								'import was canceled (after too many pages failed to load)'
-							);
-						}
-
-						// Report progress as complete
-						progress.reportProgress(progressTotal, progressTotal);
-
-						return;
-					}
+					console.error(`Failed to fetch pages for section ${section.id}, skipping to next section.`, e);
+					progress.reportFailed(section.title, e);
+					continue;
 				}
-
-				// report progress even if page import fails or is skipped
-				progress.reportProgress(++progressCurrent, progressTotal);
 			}
+
+			if (!pages.length) continue;
+
+			this.insertPagesToSection(pages, section.id);
+			queue.push(...pages);
+
+			// Grow the remaining total before importing.
+			progress.reportProgress(0, queue.length);
 		}
+
+		return queue;
 	}
 
 	insertPagesToSection(pages: OnenotePage[], sectionId: string, parentEntity?: Notebook | SectionGroup) {
@@ -540,123 +849,61 @@ export class OneNoteImporter extends FormatImporter {
 	}
 
 	async processFile(progress: ImportContext, content: string, page: OnenotePage) {
+		const splitContent = PageContentError.wrapping(() => this.convertFormat(content));
+		const lastModified = page.lastModifiedDateTime ? Date.parse(page.lastModifiedDateTime) : null;
+		const created = page.createdDateTime ? Date.parse(page.createdDateTime) : null;
+		const outputFolder = await this.getOutputFolder();
+		const outputPath = this.getEntityPathNoParent(page.id!, outputFolder!.name)!;
+
+		let pageFolder: TFolder;
+		if (!await this.vault.adapter.exists(outputPath)) {
+			pageFolder = await this.vault.createFolder(outputPath);
+		}
+		else {
+			const existing = this.vault.getAbstractFileByPath(outputPath);
+			if (!(existing instanceof TFolder)) throw new Error(`${outputPath} is not a folder`);
+			pageFolder = existing;
+		}
+		const notePath = `${pageFolder.path}/${sanitizeFileName(page.title, pageFolder.path)}.md`;
+
+		let inkEmbedMarkdown = '';
 		try {
-			const splitContent = this.convertFormat(content);
-			const outputFolder = await this.getOutputFolder();
-			const outputPath = this.getEntityPathNoParent(page.id!, outputFolder!.name)!;
+			const svgContent = inkmlToSvg(splitContent.inkml);
+			if (svgContent) {
+				// A page title may hold characters a file name cannot.
+				const svgFilename = `${sanitizeFileName(page.title)} - Ink.svg`;
+				// The drawing was built here, so what is on disk can be compared
+				// against it outright rather than guessed at from its name.
+				const { path: svgPath, reuse } = await this.placeAttachment(svgFilename, notePath,
+					async existing => await this.vault.read(existing) === svgContent ? 'same' : 'another');
 
-			let pageFolder: TFolder;
-			if (!await this.vault.adapter.exists(outputPath)) pageFolder = await this.vault.createFolder(outputPath);
-			else pageFolder = this.vault.getAbstractFileByPath(outputPath) as TFolder;
-
-			// Process InkML content if present and convert to SVG
-			let inkEmbedMarkdown = '';
-			try {
-				const svgContent = inkmlToSvg(splitContent.inkml);
-				if (svgContent) {
-					// Save the SVG as an attachment
-					const svgFilename = `${page.title} - Ink.svg`;
-					await this.vault.create(`${pageFolder.path}/${svgFilename}`, svgContent);
-
-					// Create markdown embed for the SVG
-					inkEmbedMarkdown = `\n\n![[${svgFilename}]]\n`;
+				if (reuse) {
+					inkEmbedMarkdown = `\n\n![[${reuse.path}]]\n`;
+				}
+				else {
+					await this.writeAttachment(svgPath, svgContent);
+					inkEmbedMarkdown = `\n\n![[${svgPath}]]\n`;
 					progress.reportAttachmentSuccess(svgFilename);
 				}
 			}
-			catch (e) {
-				console.error('Failed to convert InkML to SVG in page:', page.title, e);
-			}
-
-			let taggedPage = this.convertTags(parseHTML(splitContent.html));
-			let html = await this.getAllAttachments(progress, taggedPage.replace(PARAGRAPH_REGEX, '<br />'));
-			this.combineCodeBlocksAsNecessary(html);
-			this.styledElementToHTML(html);
-			this.convertInternalLinks(html);
-			this.convertMathML(html); // Convert MathML to LaTeX before text escaping
-			this.removeExtraListItemParagraphs(html);
-			this.escapeTextNodes(html);
-
-			let mdContent = htmlToMarkdown(html).trim().replace(PARAGRAPH_REGEX, ' ');
-
-			// OneNote seems to always place the "InkNode is not supported" comments at the top of the note.
-			// Additionally, the InkML combines all ink content into one block, so the best we can do is append
-			// it to the end of the note.
-			if (inkEmbedMarkdown) {
-				mdContent += inkEmbedMarkdown;
-			}
-
-			const fileRef = await this.saveAsMarkdownFile(pageFolder, page.title!, mdContent);
-
-			// Add the last modified and creation time metadata
-			const lastModified = page?.lastModifiedDateTime ? Date.parse(page.lastModifiedDateTime) : null;
-			const created = page?.createdDateTime ? Date.parse(page.createdDateTime) : null;
-			const writeOptions: DataWriteOptions = {
-				ctime: created ?? lastModified ?? Date.now(),
-				mtime: lastModified ?? created ?? Date.now(),
-			};
-			await this.vault.append(fileRef, '', writeOptions);
-			progress.reportNoteSuccess(page.title!);
 		}
 		catch (e) {
-			progress.reportFailed(page.title!, e);
+			console.error('Failed to convert InkML to SVG in page:', page.title, e);
+			progress.reportFailed(i18n.importer.onenote.labelInk({ page: String(page.title) }), e);
 		}
-	}
 
-	/** Convert MathML elements to LaTeX format for Obsidian */
-	convertMathML(pageElement: HTMLElement): void {
-		const mathElements = Array.from(pageElement.querySelectorAll('math'));
+		const html = await this.getAllAttachments(
+			progress, convertPageTags(splitContent.html), notePath, lastModified ?? undefined);
+		let mdContent = PageContentError.wrapping(() => pageToMarkdown(html));
 
-		for (const mathElement of mathElements) {
-			try {
-				// Get the MathML as a string
-				const mathMLString = mathElement.outerHTML;
+		if (inkEmbedMarkdown) mdContent += inkEmbedMarkdown;
 
-				// Convert MathML to LaTeX using mathml2latex
-				const latexString = MathMLToLaTeX.convert(mathMLString);
-
-				// Create the appropriate LaTeX syntax for Obsidian.
-				//
-				// MathML exported from OneNote all include the attribute display="block",
-				// but we can safely convert them to inline form, as the block form would
-				// be wrapped in <br /> line breaks.
-				let obsidianMath = `$${latexString}$`;
-
-				// Create a text node with the LaTeX
-				const textNode = document.createTextNode(obsidianMath);
-
-				// Replace the MathML element with the LaTeX text node
-				mathElement.parentNode?.replaceChild(textNode, mathElement);
-			}
-			catch (error) {
-				console.warn('Failed to convert MathML to LaTeX:', error);
-				// If conversion fails, keep the original MathML or replace with a placeholder
-				const fallbackText = document.createTextNode('[Math equation - conversion failed]');
-				mathElement.parentNode?.replaceChild(fallbackText, mathElement);
-			}
-		}
-	}
-
-	isLatexMath(text: string): boolean {
-		const trimmed = text.trim();
-		return (trimmed.startsWith('$') && trimmed.endsWith('$')) || (trimmed.startsWith('$$') && trimmed.endsWith('$$'));
-	}
-
-	/** Escape characters which will cause problems after converting to markdown. */
-	escapeTextNodes(node: ChildNode): void {
-		if (node.nodeType === Node.TEXT_NODE && node.textContent) {
-			// Don't escape text that contains LaTeX math expressions
-			if (this.isLatexMath(node.textContent)) {
-				return;
-			}
-
-			node.textContent = node.textContent
-				.replace(/([<>])/g, '\\$1');
-		}
-		else {
-			for (let i = 0; i < node.childNodes.length; i++) {
-				this.escapeTextNodes(node.childNodes[i]);
-			}
-		}
+		const writeOptions: DataWriteOptions = {
+			ctime: created ?? lastModified ?? Date.now(),
+			mtime: lastModified ?? created ?? Date.now(),
+		};
+		const { written } = await this.writeNote(progress, pageFolder, page.title!, mdContent, { ...writeOptions, sourceId: page.id });
+		if (written) progress.reportNoteSuccess(page.title!);
 	}
 
 	// OneNote returns page data and inking data in one file, so we need to split them
@@ -692,42 +939,10 @@ export class OneNoteImporter extends FormatImporter {
 		return output;
 	}
 
-	convertTags(pageElement: HTMLElement): string {
-		const tagElements = Array.from(pageElement.querySelectorAll('[data-tag]'));
-
-		for (const element of tagElements) {
-			// If a to-do tag, then convert it into a Markdown task list
-			if (element.getAttribute('data-tag')?.contains('to-do')) {
-				const isChecked = element.getAttribute('data-tag') === 'to-do:completed';
-				const check = isChecked ? '[x]' : '[ ]';
-				// Prepend a text node so any nested elements (e.g. an image marked as TO-DO) are preserved
-				element.prepend(`- ${check} `);
-			}
-			// All other OneNote tags are already in the Obsidian tag format ;)
-			else {
-				const tags = element.getAttribute('data-tag')?.split(',');
-				tags?.forEach((tag) => {
-					element.append(` #${tag.replace(':', '-')} `);
-				});
-			}
-		}
-		return pageElement.outerHTML;
-	}
-
-	convertInternalLinks(pageElement: HTMLElement): void {
-		const links: HTMLAnchorElement[] = pageElement.findAll('a') as HTMLAnchorElement[];
-		for (const link of links) {
-			if (link.href.startsWith('onenote:')) {
-				const startIdx = link.href.indexOf('#') + 1;
-				const endIdx = link.href.indexOf('&', startIdx);
-				link.href = link.href.slice(startIdx, endIdx);
-			}
-		}
-	}
-
 	getEntityPathNoParent(entityID: string, currentPath: string): string | null {
 		for (const notebook of this.notebooks) {
-			const path = this.getEntityPath(entityID, `${currentPath}/${notebook.displayName}`, notebook);
+			const sanitizedName = sanitizeFileName(notebook.displayName || 'Untitled Notebook');
+			const path = this.getEntityPath(entityID, `${currentPath}/${sanitizedName}`, notebook);
 			if (path) return path;
 		}
 		return null;
@@ -779,20 +994,34 @@ export class OneNoteImporter extends FormatImporter {
 					 * ...Section/Example/Page.md and ...Section/Example/Lower level.md
 					 */
 					if (section.pages![i + 1] && section.pages![i + 1].level !== 0) {
-						returnPath = `${currentPath}/${page.title}`;
+						const sanitizedName = sanitizeFileName(page.title);
+						returnPath = `${currentPath}/${sanitizedName}`;
 					}
 					else returnPath = currentPath;
 				}
 				else {
-					returnPath = currentPath;
+					// Every page above this one owns a folder, so a page two
+					// levels down sits under both. Stopping at the nearest
+					// parent left it a level up, beside a folder it is not in.
+					const ancestors: string[] = [];
+					let wanted = page.level! - 1;
 
-					// Iterate backward to find the parent page
-					for (let i = section.pages!.indexOf(page) - 1; i >= 0; i--) {
-						if (section.pages![i].level === page.level! - 1) {
-							returnPath += '/' + section.pages![i].title;
-							break;
-						}
+					for (let i = section.pages!.indexOf(page) - 1; i >= 0 && wanted >= 0; i--) {
+						const above = section.pages![i];
+
+						// Deeper than what is being looked for: another page's
+						// subtree, which this page is not in.
+						if (above.level! > wanted) continue;
+
+						ancestors.unshift(sanitizeFileName(above.title));
+
+						// Carry on from the level this page is actually at, so a
+						// subpage whose own parent is missing still lands inside
+						// the page it follows rather than an earlier one.
+						wanted = above.level! - 1;
 					}
+
+					returnPath = [currentPath, ...ancestors].join('/');
 				}
 				break;
 			}
@@ -804,9 +1033,10 @@ export class OneNoteImporter extends FormatImporter {
 		// Recursively search in section groups
 		let returnPath: string | null = null;
 		for (const sectionGroup of sectionGroups) {
-			if (sectionGroup.id === entityID) returnPath = `${currentPath}/${sectionGroup.displayName}`;
+			const sanitizedName = sanitizeFileName(sectionGroup.displayName);
+			if (sectionGroup.id === entityID) returnPath = `${currentPath}/${sanitizedName}`;
 			else {
-				const foundPath = this.getEntityPath(entityID, `${currentPath}/${sectionGroup.displayName}`, sectionGroup);
+				const foundPath = this.getEntityPath(entityID, `${currentPath}/${sanitizedName}`, sectionGroup);
 				if (foundPath) {
 					returnPath = foundPath;
 					break;
@@ -816,24 +1046,10 @@ export class OneNoteImporter extends FormatImporter {
 		return returnPath;
 	}
 
-	// Helper function to sanitize OCR text for markdown
-	private sanitizeOCRText(text: string): string {
-		// Only keep word characters, digits, spaces, and basic punctuation.
-		text = text.replace(/[^\w\d\s.,!?]/g, '');
-
-		// Replace multiple spaces with single space and trim
-		text = text.replace(/\s+/g, ' ').trim();
-
-		// Truncate to a reasonable length
-		if (text.length > 50) {
-			text = text.substring(0, 50) + '...';
-		}
-
-		return text;
-	}
-
 	// Download all attachments and add embedding syntax for supported file formats.
-	async getAllAttachments(progress: ImportContext, pageHTML: string): Promise<HTMLElement> {
+	async getAllAttachments(
+		progress: ImportContext, pageHTML: string, notePath: string, sourceMtime?: number
+	): Promise<HTMLElement> {
 		const pageElement = parseHTML(pageHTML.replace(SELF_CLOSING_REGEX, '<$1$2></$1>'));
 
 		const objects: HTMLElement[] = pageElement.findAll('object');
@@ -842,62 +1058,71 @@ export class OneNoteImporter extends FormatImporter {
 		const videos: HTMLIFrameElement[] = pageElement.findAll('iframe') as HTMLIFrameElement[];
 
 		for (const object of objects) {
-			// Objects may contain child nodes which would be lost when the object is replaced by markdown.
-			// To preserve these, move any child items to be siblings of the object
+			const next = object.nextSibling;
 			while (object.firstChild) {
-				object.parentNode?.insertBefore(object.firstChild, object.nextSibling);
+				object.parentNode?.insertBefore(object.firstChild, next);
 			}
 
-			let split: string[] = object.getAttribute('data-attachment')!.split('.');
-			const extension: string = split[split.length - 1];
+			const originalName = object.getAttribute('data-attachment');
+			if (!originalName) {
+				progress.reportFailed(
+					i18n.importer.onenote.labelAttachment(),
+					i18n.importer.onenote.reasonNoAttachmentName()
+				);
+				continue;
+			}
 
-			// If the page contains an incompatible file and user doesn't want to import them, skip
+			const [, extension] = splitext(originalName);
 			if (!ATTACHMENT_EXTS.contains(extension) && !this.importIncompatibleAttachments) {
 				continue;
 			}
-			else {
-				const originalName = object.getAttribute('data-attachment')!;
-				const contentLocation = object.getAttribute('data')!;
-				const filename = await this.fetchAttachment(progress, originalName, contentLocation);
 
-				// Create a new <p> element with the Markdown-style link
-				const markdownLink = document.createElement('p');
-				markdownLink.innerText = `![[${filename}]]`;
-
-				// Replace the <object> tag with the new <p> element
-				object.parentNode?.replaceChild(markdownLink, object);
+			const contentLocation = object.getAttribute('data');
+			if (!contentLocation) {
+				progress.reportFailed(originalName, i18n.importer.onenote.reasonNoAttachmentUrl());
+				continue;
 			}
+
+			const filename = await this.fetchAttachment(
+				progress, originalName, contentLocation, notePath, sourceMtime);
+			if (!filename) continue;
+
+			// Create a new <p> element with the Markdown-style link
+			const markdownLink = createEl('p');
+			markdownLink.innerText = `![[${filename}]]`;
+
+			// Replace the <object> tag with the new <p> element
+			object.parentNode?.replaceChild(markdownLink, object);
 		}
 
-		for (let i = 0; i < images.length; i++) {
-			const image = images[i];
-			let split: string[] = image.getAttribute('data-fullres-src-type')!.split('/');
-			const extension: string = split[1];
-			const currentDate = moment().format('YYYYMMDDHHmmss');
-			const fileName: string = `Exported image ${currentDate}-${i}.${extension}`;
-			const contentLocation = image.getAttribute('data-fullres-src')!;
-			const outputPath = await this.fetchAttachment(progress, fileName, contentLocation);
+		for (const image of images) {
+			// OneNote stores its OCR output in alt text.
+			image.removeAttribute('alt');
+
+			const contentLocation = image.getAttribute('data-fullres-src');
+			if (!contentLocation) {
+				progress.reportFailed(i18n.importer.onenote.labelImage(), i18n.importer.onenote.reasonNoImageUrl());
+				continue;
+			}
+
+			const extension = extensionForMime(image.getAttribute('data-fullres-src-type') ?? '') || 'png';
+			const fileName = `${parseFilePath(notePath).basename} image.${extension}`;
+			const outputPath = await this.fetchAttachment(
+				progress, fileName, contentLocation, notePath, sourceMtime, true);
 			if (outputPath) {
 				image.src = encodeURI(outputPath);
-				if (!image.alt || BASE64_REGEX.test(image.alt)) {
-					image.alt = 'Exported image';
-				}
-				else {
-					// Sanitize OCR text to ensure valid markdown
-					image.alt = this.sanitizeOCRText(image.alt) || 'Exported image';
-				}
 			}
 		}
 
 		for (const video of videos) {
 			// Obsidian only supports embedding YouTube videos, unlike OneNote
 			if (video.src.contains('youtube.com') || video.src.contains('youtu.be')) {
-				const embedNode = document.createTextNode(`![Embedded YouTube video](${video.src})`);
+				const embedNode = video.doc.createTextNode(`![Embedded YouTube video](${video.src})`);
 				video.parentNode?.replaceChild(embedNode, video);
 			}
 			else {
 				// If it's any other website, convert to a basic link
-				const linkNode = document.createElement('a');
+				const linkNode = createEl('a');
 				linkNode.href = video.src;
 				video.parentNode?.replaceChild(linkNode, video);
 			}
@@ -906,177 +1131,157 @@ export class OneNoteImporter extends FormatImporter {
 		return pageElement;
 	}
 
-	async fetchAttachment(progress: ImportContext, filename: string, contentLocation: string) {
-		// Every 7 attachments, do a few second break to prevent rate limiting
-		if (this.attachmentDownloadPauseCounter === 7) {
-			await new Promise(resolve => {
-				progress.status('Pausing attachment download to avoid rate limiting.');
-				this.attachmentDownloadPauseCounter = 0;
-				setTimeout(resolve, 3000);
-			});
-		}
-		this.attachmentDownloadPauseCounter++;
-
-		progress.status('Downloading attachment ' + filename);
-
+	async fetchAttachment(
+		progress: ImportContext,
+		filename: string,
+		contentLocation: string,
+		notePath: string,
+		sourceMtime?: number,
+		stableName = false,
+	): Promise<string | null> {
 		try {
-			// We don't need to remember claimedPaths because we're writing the attachments immediately.
-			const outputPath = await this.getAvailablePathForAttachment(filename, []);
-			const data = (await this.fetchResource(contentLocation, 'file', progress));
-			await this.app.vault.createBinary(outputPath, data);
+			const outputName = stableName ? await resourceFilename(filename, contentLocation) : filename;
+			const attachmentKey = this.attachmentKey(contentLocation, notePath);
+			const attachmentResource = resourceId(contentLocation);
+			let data: ArrayBuffer | null = null;
+			const download = async (): Promise<ArrayBuffer> => {
+				if (data !== null) return data;
+
+				if (this.throttleSpacingMs > 0) {
+					await new Promise(resolve => window.setTimeout(resolve, this.throttleSpacingMs));
+				}
+
+				progress.status(i18n.importer.onenote.statusDownloading({ name: filename }));
+				const fetched = await this.fetchResource(contentLocation, 'file', progress);
+				data = fetched;
+				this.throttleSpacingMs = Math.max(0, this.throttleSpacingMs - ATTACHMENT_SPACING_STEP_MS);
+				return fetched;
+			};
+
+			if (this.duplicateHandling !== DuplicateHandling.CreateCopy) {
+				const mappedPath = this.attachmentPaths.get(attachmentKey);
+				if (mappedPath) {
+					const mapped = this.vault.getAbstractFileByPath(mappedPath);
+					if (mapped instanceof TFile && this.attachmentOwner(mapped.path) === attachmentResource) {
+						this.claimPath(mapped.path);
+						const stale = sourceMtime !== undefined && sourceMtime > mapped.stat.mtime;
+						if (!stale || this.duplicateHandling === DuplicateHandling.Skip) {
+							progress.reportSkipped(filename, i18n.reason.alreadyInVault());
+							return mapped.path;
+						}
+
+						await this.writeAttachment(mapped.path, await download(), { mtime: sourceMtime });
+						progress.reportAttachmentSuccess(filename);
+						return mapped.path;
+					}
+
+					this.forgetAttachment(attachmentKey);
+				}
+			}
+
+			const { path: outputPath, reuse } = await this.placeAttachment(outputName, notePath, async existing => {
+				const owner = this.attachmentOwner(existing.path);
+				if (owner && owner !== attachmentResource) return 'another';
+
+				if (stableName && sourceMtime !== undefined) {
+					return sourceMtime > existing.stat.mtime ? 'stale' : 'same';
+				}
+
+				const downloaded = await download();
+				if (downloaded.byteLength !== existing.stat.size) return stableName ? 'stale' : 'another';
+				if (sameBytes(await this.vault.readBinary(existing), downloaded)) return 'same';
+				return stableName ? 'stale' : 'another';
+			});
+
+			if (reuse) {
+				this.rememberAttachment(attachmentKey, reuse.path);
+				progress.reportSkipped(filename, i18n.reason.alreadyInVault());
+				return reuse.path;
+			}
+
+			await this.writeAttachment(
+				outputPath, await download(), sourceMtime === undefined ? undefined : { mtime: sourceMtime });
+			this.rememberAttachment(attachmentKey, outputPath);
 			progress.reportAttachmentSuccess(filename);
 			return outputPath;
 		}
 		catch (e) {
-			progress.reportFailed(filename);
+			progress.reportFailed(filename, e);
 			console.error(e);
+			return null;
 		}
 	}
 
-	/**
-	 * Given code blocks in separate paragraphs that are only separated by a
-	 * single newline (br), combine them.
-	 */
-	combineCodeBlocksAsNecessary(pageElement: HTMLElement): void {
-		const paragraphs = pageElement.querySelectorAll('p:has(+ br + p)');
-		// querySelectorAll must return results in document order, so we should combine nodes in reverse order
-		Array.from(paragraphs).reverse().forEach((p) => {
-			const firstParagraph = p;
-			const lineBreak = p.nextElementSibling;
-			if (!isBRElement(lineBreak)) {
-				throw new Error(`Expected a <br> element after the paragraph, but found: ${lineBreak?.nodeName}`);
-			}
-			const secondParagraph = lineBreak.nextElementSibling;
-			if (isParagraphWrappingOnlyCode(firstParagraph)
-				&& isParagraphWrappingOnlyCode(secondParagraph)) {
-				// move the line break ...
-				firstParagraph.appendChild(lineBreak);
-				// .. and add another line break to capture the newline between
-				// the two paragraphs
-				firstParagraph.appendChild(lineBreak.cloneNode());
-				// ... and clone second paragraph's children into the first paragraph
-				firstParagraph.append(...Array.from(secondParagraph.childNodes));
-				// clean-up the DOM (linebreak was moved, second paragraph wasn't)
-				secondParagraph.remove();
-			}
-		});
+	private attachmentKey(contentLocation: string, notePath: string): string {
+		const { mode, path } = this.attachmentLocation;
+		const note = mode === 'note' || mode === 'subfolder' ? notePath : '';
+		return [resourceId(contentLocation), mode, path, note].join('\n');
 	}
 
-	// Convert OneNote styled elements to valid HTML for proper htmlToMarkdown conversion
-	styledElementToHTML(pageElement: HTMLElement): void {
-		// Map styles to their elements
-		const styleMap: { [key: string]: string } = {
-			'font-weight:bold': 'b',
-			'font-style:italic': 'i',
-			'text-decoration:underline': 'u',
-			'text-decoration:line-through': 's',
-			'background-color': 'mark',
-		};
-		// Cites/quotes are not converted into Markdown (possible htmlToMarkdown bug?), so we do it ourselves temporarily
-		const cites = pageElement.findAll('cite');
-		cites.forEach((cite) => {
-			cite.prepend('> ');
-			cite.append(cite.ownerDocument.createElement('br'));
-		});
-
-		const elements = pageElement.querySelectorAll('*');
-		elements.forEach(element => {
-			if (!pageElement.contains(element)) {
-				// already processed and removed, can skip
-				return;
-			}
-
-			if (isInlineCodeSpan(element)) {
-				// Convert preformatted text into an inline code span
-				const codeElement = document.createElement('code');
-				codeElement.append(...Array.from(element.childNodes));
-				element.replaceWith(codeElement);
-			}
-			else if (isFenceCodeBlock(element)) {
-				// Convert preformatted text into a code fence wrapped in a pre element
-				const codeElement = document.createElement('pre');
-				codeElement.append('```\n');
-				codeElement.append(...Array.from(element.childNodes));
-				getSiblingsInSameCodeBlock(element).forEach(sibling => {
-					if (isBRElement(sibling)) {
-						codeElement.append('\n');
-					}
-					else {
-						codeElement.append(...Array.from(sibling.childNodes));
-					}
-					sibling.remove();
-				});
-				codeElement.append('\n```');
-
-				// replace the original node with the pre element
-				element.replaceWith(codeElement);
-			}
-			else {
-				if (element.nodeName === 'TD') {
-					// Do not replace table cells if they are styled.
-					element.removeAttribute('style');
-					return;
-				}
-				else {
-					const style = element.getAttribute('style') || '';
-					const matchingStyle = Object.keys(styleMap).find(key => style.includes(key));
-					if (matchingStyle) {
-						const newElementTag = styleMap[matchingStyle];
-						const newElement = document.createElement(newElementTag);
-						newElement.append(...Array.from(element.childNodes));
-						element.replaceWith(newElement);
-					}
-				}
-			}
-		});
+	private attachmentResource(key: string): string {
+		const separator = key.indexOf('\n');
+		return separator < 0 ? key : key.slice(0, separator);
 	}
 
-	// OneNote wraps list items in an extra, marginless paragraph. Remove these
-	// as they result in turndown adding extra newlines, which is particularly
-	// bad when dealing with nested bulletted lists.
-	// 
-	// BEFORE:
-	// 	<ul>
-	//		<li>
-	//			<p style="margin-top:0pt;margin-bottom:0pt">List Item 1</p>
-	//			<ul>
-	//				<li style="list-style-type:circle">List Item 1.a</li>
-	//			</ul>
-	//		</li>
-	//	</ul>
-	//
-	// AFTER:
-	// 	<ul>
-	//		<li>
-	//			List Item 1
-	//			<ul>
-	//				<li style="list-style-type:circle">List Item 1.a</li>
-	//			</ul>
-	//		</li>
-	//	</ul>
-	//
-	// https://github.com/obsidianmd/obsidian-importer/issues/363
-	removeExtraListItemParagraphs(element: HTMLElement): void {
-		// if the first list item child is a paragraph
-		element.querySelectorAll('li > p:first-child').forEach((p) => {
-			if (
-				isHTMLElement(p)
-				// and it has 0 margin (this is really just to sanity check that this isn't meant to create newlines, visually)
-				&& p.style.marginBottom === '0pt' && p.style.marginTop === '0pt'
-			) {
-				// then unwrap the paragraph (move its children up to its parent, so there is no paragraph)
-				p.replaceWith(...Array.from(p.childNodes));
-			}
-		});
+	private attachmentPathKey(path: string): string {
+		return path.toLowerCase();
 	}
 
+	private attachmentOwner(path: string): string | null {
+		return this.attachmentOwners.get(this.attachmentPathKey(path)) ?? null;
+	}
 
-	// Fetches an Microsoft Graph resource and automatically handles rate-limits/errors
-	async fetchResource<T = string>(url: string, returnType: 'text', progress?: ImportContext | undefined, retryCount?: number | undefined): Promise<T>;
-	async fetchResource<T = ArrayBuffer>(url: string, returnType: 'file', progress?: ImportContext | undefined, retryCount?: number | undefined): Promise<T>;
-	async fetchResource<T>(url: string, returnType: 'json', progress?: ImportContext | undefined, retryCount?: number | undefined): Promise<T>;
-	async fetchResource<T>(url: string, returnType: 'json-wrapped', progress?: ImportContext | undefined, retryCount?: number | undefined): Promise<JSONWrappedResponse<T>>;
-	async fetchResource<T>(url: string, returnType: 'text' | 'file' | 'json' | 'json-wrapped', progress?: ImportContext | undefined, retryCount: number = 0): Promise<string | ArrayBuffer | object | JSONWrappedResponse<T>> {
+	private forgetAttachment(key: string): void {
+		const path = this.attachmentPaths.get(key);
+		if (!path) return;
+
+		this.attachmentPaths.delete(key);
+		const pathKey = this.attachmentPathKey(path);
+		if (![...this.attachmentPaths.values()].some(other => this.attachmentPathKey(other) === pathKey)) {
+			this.attachmentOwners.delete(pathKey);
+		}
+		this.attachmentPathsChanged = true;
+	}
+
+	private rememberAttachment(key: string, path: string): void {
+		const resource = this.attachmentResource(key);
+		const owner = this.attachmentOwner(path);
+		if (this.attachmentPaths.get(key) === path && owner === resource) return;
+		if (owner && owner !== resource) {
+			throw new Error(`Attachment path is already owned by another OneNote resource: ${path}`);
+		}
+
+		this.forgetAttachment(key);
+		this.attachmentPaths.set(key, path);
+		this.attachmentOwners.set(this.attachmentPathKey(path), resource);
+		this.attachmentPathsChanged = true;
+	}
+
+	async finalizeMarkdownOutput(ctx?: ImportContext): Promise<void> {
+		await super.finalizeMarkdownOutput(ctx);
+		if (!this.attachmentPathsChanged || !this.host.plugin) return;
+
+		try {
+			const data = await this.host.plugin.loadData();
+			data.onenoteAttachments = Object.fromEntries(this.attachmentPaths);
+			await this.host.plugin.saveData(data);
+			this.attachmentPathsChanged = false;
+		}
+		catch (error) {
+			console.error('Could not save OneNote attachment identities', error);
+		}
+	}
+
+	async fetchResource<T = string>(url: string, returnType: 'text', progress?: ImportContext): Promise<T>;
+	async fetchResource<T = ArrayBuffer>(url: string, returnType: 'file', progress?: ImportContext): Promise<T>;
+	async fetchResource<T>(url: string, returnType: 'json', progress?: ImportContext): Promise<T>;
+	async fetchResource<T>(url: string, returnType: 'json-wrapped', progress?: ImportContext): Promise<JSONWrappedResponse<T>>;
+	async fetchResource<T>(url: string, returnType: ResourceType, progress?: ImportContext): Promise<FetchedResource<T>> {
+		return this.fetchWithRetry<T>(url, returnType, progress, 0, false);
+	}
+
+	/** `retryCount` and `refreshed` are what one attempt hands the next. */
+	private async fetchWithRetry<T>(url: string, returnType: ResourceType, progress: ImportContext | undefined, retryCount: number, refreshed: boolean): Promise<FetchedResource<T>> {
 		// Check if we need to reject early WITHOUT retrying, outside the
 		// try/catch block
 		if (retryCount >= MAX_RETRY_ATTEMPTS) {
@@ -1088,29 +1293,28 @@ export class OneNoteImporter extends FormatImporter {
 		const ninetyMinutesInMS = 1_000 * 60 * 90;
 		if (timeSinceLastFetch > ninetyMinutesInMS) {
 			// fail the entire import by aborting
-			this.modal.abortController.abort('stalled for >90 minutes');
+			this.host.abortController.abort('stalled for >90 minutes');
 		}
 
-		if (this.modal.abortController.signal.aborted) {
-			const abortReason = this.modal.abortController.signal.reason ?? 'no reason given';
+		if (this.host.abortController.signal.aborted) {
+			const abortReason = this.host.abortController.signal.reason ?? 'no reason given';
 			throw new Error(`The import was aborted (${abortReason})`);
 		}
 
 		try {
-			// any errors that happen in the try block will be retried.
-			if (retryCount > 0) {
-				console.log(`Retry attempt #${retryCount} for ${url}`);
-			}
+			// This request must be abortable; requestUrl has no AbortSignal support.
 			let response = await fetch(
 				url,
 				{
-					headers: { Authorization: `Bearer ${this.graphData.accessToken}` },
-					signal: this.modal.abortController.signal,
+					headers: {
+						Authorization: `Bearer ${this.graphData.accessToken}`,
+					},
+					signal: this.host.abortController.signal,
 				}
 			);
 
 			if (response.ok) {
-				let result: string | ArrayBuffer | object | JSONWrappedResponse<T>;
+				let result: FetchedResource<T>;
 
 				switch (returnType) {
 					case 'text':
@@ -1138,11 +1342,12 @@ export class OneNoteImporter extends FormatImporter {
 			}
 			else {
 				let err: PublicError | null = null;
-				const respJson = await response.json();
-				if (respJson.hasOwnProperty('error')) {
-					err = respJson.error;
+				// Graph error bodies may be empty or non-JSON.
+				const respJson: unknown = await response.json().catch(() => null);
+				if (respJson && typeof respJson === 'object' && 'error' in respJson) {
+					err = (respJson as { error: PublicError }).error;
 				}
-				console.log('An error has occurred while fetching an resource:', err ? err : respJson);
+				console.error('An error has occurred while fetching an resource:', err ? err : respJson);
 
 				// If our access token has expired, becomes invalid, or is
 				// otherwise no longer authorized, then refresh it and try
@@ -1151,12 +1356,22 @@ export class OneNoteImporter extends FormatImporter {
 					|| err?.code === 'InvalidAuthenticationToken'
 					|| response.status === 401;
 				if (isNotAuthorized) {
+					if (refreshed) throw new GraphRefusal(response.status, err);
+
 					await this.updateAccessToken();
-					return this.fetchResource(url, returnType as any, progress, retryCount + 1);
+					return this.fetchWithRetry<T>(url, returnType, progress, retryCount + 1, true);
 				}
 
 				// We're rate-limited - let's retry after the suggested amount of time
-				if (err?.code === '20166' || response.status === 429) {
+				if (err?.code === THROTTLED || response.status === 429) {
+					this.throttleSpacingMs = Math.min(
+						MAX_ATTACHMENT_SPACING_MS,
+						this.throttleSpacingMs + ATTACHMENT_SPACING_STEP_MS,
+					);
+
+					// Imports can wait; picker loads should fail visibly.
+					if (!progress) throw new GraphRefusal(429, err);
+
 					const retryAfter = response.headers.get('Retry-After');
 					// If we're rate-limited, the soonest we'll be able to make
 					// the request again is the next minute, so wait either as
@@ -1166,29 +1381,39 @@ export class OneNoteImporter extends FormatImporter {
 					// https://learn.microsoft.com/en-us/graph/throttling-limits#onenote-service-limits
 					// for more info.
 					let retryTimeSeconds = retryAfter ? (+retryAfter * 1) : 60;
-					console.log(`Rate limit exceeded, waiting for: ${retryTimeSeconds} seconds`);
-					await this.pause(
+					console.warn(`Rate limit exceeded, waiting for: ${retryTimeSeconds} seconds`);
+					await this.backOff(
 						retryTimeSeconds,
-						`OneNote API is rate-limiting us`,
+						'rate limited by OneNote',
 						progress,
 					);
 
-					return this.fetchResource(
+					return this.fetchWithRetry<T>(
 						url,
-						returnType as any,
+						returnType,
 						progress,
 						// don't increment the retryCount because we were told
 						// to backoff, and we should infinitely retry on backoff
 						// errors.
-						retryCount
+						retryCount,
+						refreshed
 					);
 				}
 
-				// for all other errors, retry.
-				return this.fetchResource(url, returnType as any, progress, retryCount + 1);
+				// A refusal, or a refused scope, will not change on retry — but
+				// OneNote does return transient bare 400s for page requests.
+				const settled = response.status === 403 || response.status === 404
+					|| err?.code === SCOPE_REFUSED;
+				if (settled || retryCount + 1 >= MAX_RETRY_ATTEMPTS) {
+					throw new GraphRefusal(response.status, err);
+				}
+
+				return this.fetchWithRetry<T>(url, returnType, progress, retryCount + 1, refreshed);
 			}
 		}
 		catch (e) {
+			if (e instanceof GraphRefusal) throw e;
+
 			console.error(`An internal error occurred while trying to fetch '${url}'. Error details: `, e);
 
 			// Attachments sometimes just fail to download
@@ -1198,7 +1423,9 @@ export class OneNoteImporter extends FormatImporter {
 			// I'm seeing such failures in normal imports where I'm not noticing
 			// any network instability on my end, let's retry those failures as
 			// well.
-			return this.fetchResource(url, returnType as any, progress, retryCount + 1);
+			if (retryCount + 1 >= MAX_RETRY_ATTEMPTS) throw e;
+
+			return this.fetchWithRetry<T>(url, returnType, progress, retryCount + 1, refreshed);
 		}
 	}
 }

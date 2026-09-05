@@ -1,14 +1,14 @@
-import { AppleNotesImporter } from '../apple-notes';
 import { ScanConverter } from './convert-scan';
 import { TableConverter } from './convert-table';
 import {
+	ANContext,
 	ANAlignment,
 	ANAttachment,
 	ANAttributeRun,
 	ANBaseline,
-	ANColor,
 	ANConverter,
 	ANDocument,
+	ANEmphasisColor,
 	ANFontWeight,
 	ANFragmentPair,
 	ANMultiRun,
@@ -18,12 +18,45 @@ import {
 } from './models';
 
 const FRAGMENT_SPLIT = /(^\s+|(?:\s+)?\n(?:\s+)?|\s+$)/;
+// Shift-Return inserts U+2028 instead of ending the paragraph.
+const SOFT_RETURN = '\u2028';
 const NOTE_URI = /applenotes:note\/([-0-9a-f]+)(?:\?ownerIdentifier=.*)?/;
 
-const DEFAULT_EMOJI = '.AppleColorEmojiUI';
+const EMPHASIS_MARKERS: Record<ANEmphasisColor, string> = {
+	[ANEmphasisColor.Purple]: '🟣',
+	[ANEmphasisColor.Pink]: '🔴',
+	[ANEmphasisColor.Orange]: '🟠',
+	[ANEmphasisColor.Mint]: '🟢',
+	[ANEmphasisColor.Blue]: '🔵'
+};
+
+const TITLE_LIMIT = 200;
+const LEADING_LIST_MARKER = /^(?:[-+*]|\d+[.)])\s+/;
+
+const URL_LINE = /^https?:\/\/\S+$/;
+
+export function firstLine(noteText: string): string {
+	return noteText
+		.split('\n')
+		.map(line => line.replace(/\uFFFC/g, '').replace(/[\u2028\u2029]/g, ' ').trim())
+		.find(line => line !== '') ?? '';
+}
+
+export function noteTitle(noteText: string, stored: string): string {
+	// Apple truncates the stored title, so prefer the note's first text line (#541).
+	const line = firstLine(noteText ?? '');
+	if (!line) return stored;
+	// Keep list syntax in the body, but not in the file name.
+	const title = line.replace(LEADING_LIST_MARKER, '').trimStart() || line;
+
+	return title.length > TITLE_LIMIT ? title.slice(0, TITLE_LIMIT).trimEnd() : title;
+}
+
 const LIST_STYLES = [
 	ANStyleType.DottedList, ANStyleType.DashedList, ANStyleType.NumberedList, ANStyleType.Checkbox
 ];
+
+const HEADING_STYLES = [ANStyleType.Title, ANStyleType.Heading, ANStyleType.Subheading];
 
 export class NoteConverter extends ANConverter {
 	note: ANNote;
@@ -31,11 +64,12 @@ export class NoteConverter extends ANConverter {
 	listNumber = 0;
 	listIndent = 0;
 	multiRun = ANMultiRun.None;
+	alignment: ANAlignment | undefined;
 
 	static protobufType = 'ciofecaforensics.Document';
 
-	constructor(importer: AppleNotesImporter, document: ANDocument | ANTableObject) {
-		super(importer);
+	constructor(ctx: ANContext, document: ANDocument | ANTableObject) {
+		super(ctx);
 		this.note = document.note;
 	}
 
@@ -77,18 +111,27 @@ export class NoteConverter extends ANConverter {
 	}
 
 	async format(table = false, parentNotePath = ''): Promise<string> {
-		let fragments = this.parseTokens();
-		let firstLineSkip = !table && this.importer.omitFirstLine && this.note.noteText.contains('\n');
+		let fragments = this.omitRedundantHeadingBold(this.parseTokens());
+		// Keep URL-only titles in the body so the working URL is not lost (#591).
+		let firstLineSkip = !table && this.ctx.omitFirstLine
+			&& this.note.noteText.contains('\n')
+			&& !URL_LINE.test(firstLine(this.note.noteText));
 		let converted = '';
+		let titleStarted = false;
 
 		for (let j = 0; j < fragments.length; j++) {
 			let { attr, fragment } = fragments[j];
 
 			if (firstLineSkip) {
-				if (fragment.contains('\n') || attr.attachmentInfo) {
+				if (attr.attachmentInfo) {
+					firstLineSkip = false;
+				}
+				else if (!titleStarted && /\S/.test(fragment) && this.leadsNestedList(fragments, j)) {
 					firstLineSkip = false;
 				}
 				else {
+					if (/\S/.test(fragment)) titleStarted = true;
+					if (titleStarted && fragment.contains('\n')) firstLineSkip = false;
 					continue;
 				}
 			}
@@ -98,13 +141,21 @@ export class NoteConverter extends ANConverter {
 
 			converted += this.formatMultiRun(attr);
 
+			if (attr.fragment.contains(SOFT_RETURN)) {
+				attr.fragment = this.expandSoftReturns(attr, converted);
+			}
+
 			if (!/\S/.test(attr.fragment) || this.multiRun == ANMultiRun.Monospaced) {
 				converted += attr.fragment;
 			}
 			else if (attr.attachmentInfo) {
-				converted += await this.formatAttachment(attr, parentNotePath);
+				attr.fragment = await this.formatAttachment(attr, parentNotePath);
+
+				converted += attr.atLineStart && !isBlockAttachment(attr)
+					? this.formatParagraph(attr)
+					: attr.fragment;
 			}
-			else if (attr.superscript || attr.underlined || attr.color || attr.font || this.multiRun == ANMultiRun.Alignment) {
+			else if (attr.superscript || attr.underlined || this.multiRun == ANMultiRun.Alignment) {
 				converted += await this.formatHtmlAttr(attr);
 			}
 			else {
@@ -113,9 +164,96 @@ export class NoteConverter extends ANConverter {
 		}
 
 		if (this.multiRun != ANMultiRun.None) converted += this.formatMultiRun({} as ANAttributeRun);
-		if (table) converted.replace('\n', '<br>').replace('|', '&#124;');
+		converted = converted.trim();
 
-		return converted.trim();
+		if (table) {
+			// Raw newlines and pipes would split the Markdown table row.
+			converted = converted.replace(/ *\n/g, '<br>').replace(/\|/g, '&#124;');
+		}
+
+		return converted;
+	}
+
+	omitRedundantHeadingBold(fragments: ANFragmentPair[]): ANFragmentPair[] {
+		let lineStart = 0;
+
+		for (let lineEnd = 0; lineEnd <= fragments.length; lineEnd++) {
+			if (lineEnd < fragments.length && !fragments[lineEnd].fragment.includes('\n')) continue;
+
+			const content = fragments
+				.slice(lineStart, lineEnd)
+				.filter(({ fragment }) => /\S/.test(fragment));
+			const style = content[0]?.attr.paragraphStyle?.styleType;
+			const allBold = content.length > 0
+				&& content.every(({ fragment }) => !fragment.includes(SOFT_RETURN))
+				&& content.every(({ attr }) =>
+					attr.fontWeight == ANFontWeight.Bold || attr.fontWeight == ANFontWeight.BoldItalic
+				);
+
+			if (style !== undefined && HEADING_STYLES.includes(style) && allBold) {
+				for (let i = lineStart; i < lineEnd; i++) {
+					const original = fragments[i].attr;
+					const fontWeight = original.fontWeight;
+					if (fontWeight != ANFontWeight.Bold && fontWeight != ANFontWeight.BoldItalic) continue;
+
+					const attr = Object.assign(
+						Object.create(Object.getPrototypeOf(original)),
+						original,
+						{ fontWeight: fontWeight == ANFontWeight.BoldItalic ? ANFontWeight.Italic : undefined }
+					) as ANAttributeRun;
+
+					fragments[i] = {
+						...fragments[i],
+						attr,
+					};
+				}
+			}
+
+			lineStart = lineEnd + 1;
+		}
+
+		return fragments;
+	}
+
+	expandSoftReturns(attr: ANAttributeRun, converted: string): string {
+		const style = attr.paragraphStyle;
+		const inCode = this.multiRun == ANMultiRun.Monospaced;
+		// Strict line breaks need two spaces; list continuations also need indentation.
+		let indent = this.ctx.strictLineBreaks && !inCode ? '  \n' : '\n';
+
+		if (!inCode && style?.styleType !== undefined && LIST_STYLES.includes(style.styleType)) {
+			indent += '\t'.repeat((style.indentAmount ?? 0) + 1);
+		}
+
+		let onALine = /\S/.test(converted.slice(converted.lastIndexOf('\n') + 1));
+		let out = '';
+
+		for (const char of attr.fragment) {
+			if (char == SOFT_RETURN) {
+				out += onALine ? indent : '\n';
+				onALine = false;
+			}
+			else {
+				out += char;
+				onALine = char == '\n' ? false : onALine || /\S/.test(char);
+			}
+		}
+
+		return out;
+	}
+
+	leadsNestedList(fragments: ANFragmentPair[], from: number): boolean {
+		const style = fragments[from].attr.paragraphStyle;
+		if (style?.styleType === undefined || !LIST_STYLES.includes(style.styleType)) return false;
+
+		const indent = style.indentAmount ?? 0;
+
+		for (let k = from + 1; k < fragments.length; k++) {
+			if (!/\S/.test(fragments[k].fragment)) continue;
+			return (fragments[k].attr.paragraphStyle?.indentAmount ?? 0) > indent;
+		}
+
+		return false;
 	}
 
 	/** Format things that cover multiple ANAttributeRuns. */
@@ -142,8 +280,10 @@ export class NoteConverter extends ANConverter {
 				break;
 
 			case ANMultiRun.Alignment:
-				if (!attr.paragraphStyle?.alignment) {
+				// Start a new block when alignment changes.
+				if (attr.paragraphStyle?.alignment !== this.alignment) {
 					this.multiRun = ANMultiRun.None;
+					this.alignment = undefined;
 					prefix += '</p>\n';
 				}
 				break;
@@ -163,7 +303,8 @@ export class NoteConverter extends ANConverter {
 			}
 			else if (attr.paragraphStyle?.alignment) {
 				this.multiRun = ANMultiRun.Alignment;
-				const val = this.convertAlign(attr?.paragraphStyle?.alignment);
+				this.alignment = attr.paragraphStyle.alignment;
+				const val = this.convertAlign(attr.paragraphStyle.alignment);
 				prefix += `\n<p style="text-align:${val};margin:0">`;
 			}
 		}
@@ -172,15 +313,13 @@ export class NoteConverter extends ANConverter {
 	}
 
 	/** Since putting markdown inside inline html tags is currentlyproblematic in Live Preview, this is a separate
-	 parser for those that is activated when HTML-only stuff (eg underline, font size) is needed */
+	 parser for those that is activated when HTML-only stuff (eg underline, superscript) is needed */
 	async formatHtmlAttr(attr: ANAttributeRun): Promise<string> {
 		if (attr.strikethrough) attr.fragment = `<s>${attr.fragment}</s>`;
 		if (attr.underlined) attr.fragment = `<u>${attr.fragment}</u>`;
 
 		if (attr.superscript == ANBaseline.Super) attr.fragment = `<sup>${attr.fragment}</sup>`;
 		if (attr.superscript == ANBaseline.Sub) attr.fragment = `<sub>${attr.fragment}</sub>`;
-
-		let style = '';
 
 		switch (attr.fontWeight) {
 			case ANFontWeight.Bold:
@@ -194,25 +333,14 @@ export class NoteConverter extends ANConverter {
 				break;
 		}
 
-		if (attr.font?.fontName && attr.font.fontName !== DEFAULT_EMOJI) {
-			style += `font-family:${attr.font.fontName};`;
+		if (attr.link) {
+			attr.fragment = NOTE_URI.test(attr.link)
+				? await this.getInternalLink(attr.link, attr.fragment)
+				: `<a href="${attr.link}" rel="noopener" class="external-link"` +
+					` target="_blank">${attr.fragment}</a>`;
 		}
 
-		if (attr.font?.pointSize) style += `font-size:${attr.font.pointSize}pt;`;
-		if (attr.color) style += `color:${this.convertColor(attr.color)};`;
-
-		if (attr.link && !NOTE_URI.test(attr.link)) {
-			if (style) style = ` style="${style}"`;
-
-			attr.fragment =
-				`<a href="${attr.link}" rel="noopener" class="external-link"` +
-				` target="_blank"${style}>${attr.fragment}</a>`;
-		}
-		else if (style) {
-			if (attr.link) attr.fragment = await this.getInternalLink(attr.link, attr.fragment);
-
-			attr.fragment = `<span style="${style}">${attr.fragment}</span>`;
-		}
+		attr.fragment = emphasise(attr);
 
 		if (attr.atLineStart) {
 			return this.formatParagraph(attr);
@@ -224,7 +352,10 @@ export class NoteConverter extends ANConverter {
 
 	async formatAttr(attr: ANAttributeRun): Promise<string> {
 		// Escape square brackets.
-		attr.fragment = attr.fragment.replace(/([\[\]])/g, '\\$1');
+		attr.fragment = attr.fragment.replace(/([[\]])/g, '\\$1');
+
+		// Escape tag-shaped text without changing C#, F#, or headings (#471).
+		attr.fragment = attr.fragment.replace(/(^|\s)#(?=[\w/-]*[A-Za-z_/-])/g, '$1\\#');
 
 		switch (attr.fontWeight) {
 			case ANFontWeight.Bold:
@@ -247,6 +378,8 @@ export class NoteConverter extends ANConverter {
 				attr.fragment = `[${attr.fragment}](${attr.link})`;
 			}
 		}
+
+		attr.fragment = emphasise(attr);
 
 		if (attr.atLineStart) {
 			return this.formatParagraph(attr);
@@ -288,9 +421,10 @@ export class NoteConverter extends ANConverter {
 				this.listNumber++;
 				return `${prelude}${indent}${this.listNumber}. ${attr.fragment}`;
 
-			case ANStyleType.Checkbox:
+			case ANStyleType.Checkbox: {
 				const box = attr.paragraphStyle!.checklist?.done ? '[x]' : '[ ]';
 				return `${prelude}${indent}- ${box} ${attr.fragment}`;
+			}
 		}
 
 		// Not a list but indented in line with one
@@ -305,47 +439,47 @@ export class NoteConverter extends ANConverter {
 		switch (attr.attachmentInfo?.typeUti) {
 			case ANAttachment.Hashtag:
 			case ANAttachment.Mention:
-				row = await this.importer.database.get`
+				row = await this.ctx.database.get`
 					SELECT zalttext FROM ziccloudsyncingobject 
 					WHERE zidentifier = ${attr.attachmentInfo.attachmentIdentifier}`;
 
 				return row.ZALTTEXT;
 
 			case ANAttachment.InternalLink:
-				row = await this.importer.database.get`
+				row = await this.ctx.database.get`
 					SELECT ztokencontentidentifier FROM ziccloudsyncingobject 
 					WHERE zidentifier = ${attr.attachmentInfo.attachmentIdentifier}`;
 
 				return await this.getInternalLink(row.ZTOKENCONTENTIDENTIFIER, undefined, parentNotePath);
 
 			case ANAttachment.Table:
-				row = await this.importer.database.get`
+				row = await this.ctx.database.get`
 					SELECT hex(zmergeabledata1) as zhexdata FROM ziccloudsyncingobject 
 					WHERE zidentifier = ${attr.attachmentInfo.attachmentIdentifier}`;
 
-				converter = this.importer.decodeData(row.zhexdata, TableConverter);
+				converter = this.ctx.decodeData(row.zhexdata, TableConverter);
 				return await converter.format();
 
 			case ANAttachment.UrlCard:
-				row = await this.importer.database.get`
+				row = await this.ctx.database.get`
 					SELECT ztitle, zurlstring FROM ziccloudsyncingobject 
 					WHERE zidentifier = ${attr.attachmentInfo.attachmentIdentifier}`;
 
 				return `[**${row.ZTITLE}**](${row.ZURLSTRING})`;
 
 			case ANAttachment.Scan:
-				row = await this.importer.database.get`
+				row = await this.ctx.database.get`
 					SELECT hex(zmergeabledata1) as zhexdata FROM ziccloudsyncingobject 
 					WHERE zidentifier = ${attr.attachmentInfo.attachmentIdentifier}`;
 
-				converter = this.importer.decodeData(row.zhexdata, ScanConverter);
+				converter = this.ctx.decodeData(row.zhexdata, ScanConverter);
 				return await converter.format(false, parentNotePath);
 
 			case ANAttachment.ModifiedScan:
 			case ANAttachment.DrawingLegacy:
 			case ANAttachment.DrawingLegacy2:
 			case ANAttachment.Drawing:
-				row = await this.importer.database.get`
+				row = await this.ctx.database.get`
 					SELECT z_pk, zhandwritingsummary 
 					FROM (SELECT *, NULL AS zhandwritingsummary FROM ziccloudsyncingobject) 
 					WHERE zidentifier = ${attr.attachmentInfo.attachmentIdentifier}`;
@@ -356,7 +490,7 @@ export class NoteConverter extends ANConverter {
 			// Actual file on disk (eg image, audio, video, pdf, vcard)
 			// Hundreds of different utis so not in the enum
 			default:
-				row = await this.importer.database.get`
+				row = await this.ctx.database.get`
 					SELECT zmedia FROM ziccloudsyncingobject 
 					WHERE zidentifier = ${attr.attachmentInfo?.attachmentIdentifier}`;
 
@@ -369,12 +503,12 @@ export class NoteConverter extends ANConverter {
 			return ` **(unknown attachment: ${attr.attachmentInfo?.typeUti})** `;
 		}
 
-		const attachment = await this.importer.resolveAttachment(id, attr.attachmentInfo!.typeUti);
+		const attachment = await this.ctx.resolveAttachment(id, attr.attachmentInfo!.typeUti);
 		let link = attachment
-			? `\n${this.app.fileManager.generateMarkdownLink(attachment, parentNotePath)}\n` 
+			? `\n!${this.ctx.linkTo(attachment, parentNotePath)}\n` 
 			: ` **(error reading attachment)**`;
 		
-		if (this.importer.includeHandwriting && row.ZHANDWRITINGSUMMARY) {
+		if (this.ctx.includeHandwriting && row.ZHANDWRITINGSUMMARY) {
 			link = `\n> [!Handwriting]-\n> ${row.ZHANDWRITINGSUMMARY.replace('\n', '\n> ')}${link}`;
 		}
 		
@@ -384,26 +518,14 @@ export class NoteConverter extends ANConverter {
 	async getInternalLink(uri: string, name: string | undefined = undefined, parentNotePath = ''): Promise<string> {
 		const identifier = uri.match(NOTE_URI)![1];
 
-		const row = await this.importer.database.get`
+		const row = await this.ctx.database.get`
 			SELECT z_pk FROM ziccloudsyncingobject 
 			WHERE zidentifier = ${identifier.toUpperCase()}`;
 
-		let file = await this.importer.resolveNote(row.Z_PK);
+		let file = await this.ctx.resolveNote(row.Z_PK);
 		if (!file) return '(unknown file link)';
 
-		return this.app.fileManager.generateMarkdownLink(
-			file, parentNotePath, undefined, name
-		);
-	}
-
-	convertColor(color: ANColor): string {
-		let hexcode = '#';
-
-		for (const channel of Object.values(color)) {
-			hexcode += Math.floor(channel * 255).toString(16);
-		}
-
-		return hexcode;
+		return this.ctx.linkTo(file, parentNotePath, undefined, name);
 	}
 
 	convertAlign(alignment: ANAlignment): string {
@@ -418,6 +540,11 @@ export class NoteConverter extends ANConverter {
 				return 'justify';
 		}
 	}
+}
+
+function emphasise(attr: ANAttributeRun): string {
+	if (!attr.emphasisColor) return attr.fragment;
+	return `==${EMPHASIS_MARKERS[attr.emphasisColor] ?? ''}${attr.fragment}==`;
 }
 
 function isBlockAttachment(attr: ANAttributeRun) {

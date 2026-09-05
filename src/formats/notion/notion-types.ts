@@ -35,7 +35,7 @@ export type YamlProperty = {
 	title: string;
 };
 
-export type FormatTagName = 'strong' | 'em' | 'mark' | 'del' | string;
+export type FormatTagName = 'strong' | 'em' | 'mark' | 'del';
 
 export type NotionLink =
 	{
@@ -100,7 +100,7 @@ export class NotionResolverInfo {
 				// Notion inline databases have no .html file and aren't a note, so we just filter them out of the folder structure.
 				.filter((parentId) => parentId)
 				// Folder names can't end in a dot or a space
-				.map((folder) => folder.replace(/[\. ]+$/, ''));
+				.map((folder) => folder.replace(/[. ]+$/, ''));
 
 			// In newer Notion exports, all files have one parent ID, but it does not
 			// map to anything in our idsToFileInfo.
@@ -124,7 +124,7 @@ export class NotionResolverInfo {
 			})
 			.filter((seg) => seg.length > 0)
 			// Folder names can't end in a dot or a space
-			.map((folder) => folder.replace(/[\. ]+$/, ''))
+			.map((folder) => folder.replace(/[. ]+$/, ''))
 			.join('/');
 
 		return folderPath ? folderPath + '/' : '';

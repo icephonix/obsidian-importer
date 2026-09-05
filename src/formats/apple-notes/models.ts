@@ -1,23 +1,35 @@
-import { App } from 'obsidian';
 import { Message } from 'protobufjs';
-import { AppleNotesImporter } from '../apple-notes';
+
+export interface ANFile {
+	path: string;
+}
+
+export interface ANContext<F extends ANFile = ANFile> {
+	omitFirstLine: boolean;
+	includeHandwriting: boolean;
+	strictLineBreaks: boolean;
+	database: SQLiteTagSpawned;
+
+	decodeData<T extends ANConverter>(hexdata: string, converterType: ANConverterType<T>): T;
+	resolveAttachment(id: number, uti: string, hasFallback?: boolean): Promise<F | null>;
+	resolveNote(id: number): Promise<F | null>;
+	linkTo(file: F, sourcePath: string, subpath?: string, display?: string): string;
+}
 
 export abstract class ANConverter {
-	importer: AppleNotesImporter;
-	app: App;
+	ctx: ANContext;
 
 	static protobufType: string;
 
-	constructor(importer: AppleNotesImporter) {
-		this.importer = importer;
-		this.app = importer.app;
+	constructor(ctx: ANContext) {
+		this.ctx = ctx;
 	}
 
 	abstract format(table?: boolean, parentNotePath?: string): Promise<string>;
 }
 
 export type ANConverterType<T extends ANConverter> = {
-	new(importer: AppleNotesImporter, x: any): T;
+	new(ctx: ANContext, x: any): T;
 	protobufType: string;
 };
 
@@ -82,6 +94,7 @@ export interface ANAttributeRun extends Message {
 	superscript?: ANBaseline;
 	link?: string;
 	color?: ANColor;
+	emphasisColor?: ANEmphasisColor;
 	attachmentInfo?: ANAttachmentInfo;
 
 	// internal additions, not part of the protobufs
@@ -145,6 +158,14 @@ export interface ANColor extends Message {
 	green: number;
 	blue: number;
 	alpha: number;
+}
+
+export enum ANEmphasisColor {
+	Purple = 1,
+	Pink = 2,
+	Orange = 3,
+	Mint = 4,
+	Blue = 5
 }
 
 export enum ANFolderType {

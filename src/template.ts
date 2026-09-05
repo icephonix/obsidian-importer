@@ -1,16 +1,22 @@
-import { Notice, Setting, setIcon } from 'obsidian';
+import { Notice, Setting, SettingGroup, setIcon } from 'obsidian';
+import { i18n } from './i18n';
 
 /**
  * Represents a field that can be used in templates.
  * Each field corresponds to a piece of data that can be inserted into templates using placeholder syntax.
  */
 export interface TemplateField {
-	/** Unique identifier for the field (used in placeholders like {{id}}) */
+	/** Unique identifier for the field (used in placeholders like {{title}}) */
 	id: string;
 	/** Human-readable label for the field */
 	label: string;
+	sourceName?: string;
 	/** Optional example value to show in the UI */
 	exampleValue?: string;
+}
+
+export function sourceVariableExpression(name: string): string {
+	return `source[${JSON.stringify(name)}]`;
 }
 
 /**
@@ -39,6 +45,14 @@ export interface TemplateOptions {
 	defaults?: Partial<TemplateConfig>;
 	/** Description of placeholder syntax (e.g., "{{column_name}}") */
 	placeholderSyntax?: string;
+	/** Whether to show the title template field (default: true) */
+	showTitleTemplate?: boolean;
+	/** Whether to show the location template field (default: true) */
+	showLocationTemplate?: boolean;
+	showProperties?: boolean;
+	showBodyTemplate?: boolean;
+	actionText?: string;
+	configure?: (container: HTMLElement, config: TemplateConfig, redrawProperties: () => void) => void;
 }
 
 /**
@@ -79,10 +93,22 @@ export class TemplateConfigurator {
 	private config: TemplateConfig;
 	private fields: TemplateField[];
 	private placeholderSyntax: string;
+	private showTitleTemplate: boolean;
+	private showLocationTemplate: boolean;
+	private showProperties: boolean;
+	private showBodyTemplate: boolean;
+	private actionText: string;
+	private configure?: (container: HTMLElement, config: TemplateConfig, redrawProperties: () => void) => void;
 
 	constructor(options: TemplateOptions) {
 		this.fields = options.fields;
 		this.placeholderSyntax = options.placeholderSyntax || '{{field_name}}';
+		this.showTitleTemplate = options.showTitleTemplate !== false; // Default to true
+		this.showLocationTemplate = options.showLocationTemplate !== false; // Default to true
+		this.showProperties = options.showProperties !== false;
+		this.showBodyTemplate = options.showBodyTemplate !== false;
+		this.actionText = options.actionText ?? i18n.modal.buttonImport();
+		this.configure = options.configure;
 
 		// Initialize config with defaults
 		this.config = {
@@ -97,131 +123,140 @@ export class TemplateConfigurator {
 	/**
 	 * Shows the template configuration UI and returns the user's configuration.
 	 * @param container The container element to display the configuration UI in
+	 * @param buttonsEl Container for the continue action
 	 * @returns The template configuration if user clicked Continue, null if cancelled
 	 */
-	async show(container: HTMLElement): Promise<TemplateConfig | null> {
+	async show(container: HTMLElement, buttonsEl: HTMLElement): Promise<TemplateConfig | null> {
 		return new Promise((resolve) => {
 			container.empty();
 
-			container.createEl('p', {
-				text: `Configure how your data should be imported. Use ${this.placeholderSyntax} syntax to reference field values.`,
+			container.createDiv({
+				cls: 'importer-screen-desc',
+				text: i18n.template.msgIntro({ syntax: this.placeholderSyntax }),
 			});
 
-			// Note title template
-			new Setting(container)
-				.setName('Note title')
-				.setDesc('Template for the note title. Use {{field_name}} to insert values.')
-				.addText(text => text
-					.setPlaceholder('{{Title}}')
-					.setValue(this.config.titleTemplate)
-					.onChange(value => {
-						this.config.titleTemplate = value;
-					}));
+			const templates = this.showTitleTemplate || this.showLocationTemplate
+				? new SettingGroup(container)
+				: null;
 
-			// Note location template
-			new Setting(container)
-				.setName('Note location')
-				.setDesc('Template for note location/path. Use {{field_name}} to organize notes.')
-				.addText(text => text
-					.setPlaceholder('{{Category}}/{{Subcategory}}')
-					.setValue(this.config.locationTemplate)
-					.onChange(value => {
-						this.config.locationTemplate = value;
-					}));
+			// Note title template (optional, based on configuration)
+			if (this.showTitleTemplate) {
+				new Setting(templates!.listEl)
+					.setName(i18n.template.nameTitle())
+					.setDesc(i18n.template.descTitle())
+					.addText(text => text
+						.setPlaceholder('{{Title}}')
+						.setValue(this.config.titleTemplate)
+						.onChange(value => {
+							this.config.titleTemplate = value;
+						}));
+			}
 
-			// Column selection for frontmatter
-			const headerContainer = container.createDiv({ cls: 'importer-frontmatter-header' });
-			headerContainer.createEl('h4', { text: 'Properties' });
+			// Note location template (optional, based on configuration)
+			if (this.showLocationTemplate) {
+				new Setting(templates!.listEl)
+					.setName(i18n.template.nameLocation())
+					.setDesc(i18n.template.descLocation())
+					.addText(text => text
+						.setPlaceholder('{{Category}}/{{Subcategory}}')
+						.setValue(this.config.locationTemplate)
+						.onChange(value => {
+							this.config.locationTemplate = value;
+						}));
+			}
 
-			const columnContainer = container.createDiv('importer-column-list');
+			let propertiesContainer: HTMLElement | null = null;
+			const drawProperties = (): void => {
+				if (!propertiesContainer) return;
+				propertiesContainer.empty();
+				const properties = new SettingGroup(propertiesContainer);
+				properties.setHeading(i18n.template.headingProperties());
 
-			// Add header row
-			const headerRow = columnContainer.createDiv('importer-column-header-row');
-			headerRow.createDiv('importer-column-name-col').setText('Property name');
-			headerRow.createDiv('importer-column-value-col').setText('Property value');
-			headerRow.createDiv('importer-column-example-col').setText('Example');
-			headerRow.createDiv('importer-column-delete-col'); // Empty space for delete button
+				const columnContainer = properties.listEl.createDiv('importer-column-list');
 
-			for (const field of this.fields) {
-				const rowEl = columnContainer.createDiv('importer-column-row');
+				const headerRow = columnContainer.createDiv('importer-column-header-row');
+				headerRow.createDiv('importer-column-name-col').setText(i18n.template.columnPropertyName());
+				headerRow.createDiv('importer-column-value-col').setText(i18n.template.columnPropertyValue());
+				headerRow.createDiv('importer-column-example-col').setText(i18n.template.columnExample());
+				headerRow.createDiv('importer-column-delete-col'); // Empty space for delete button
 
-				// Property name input column
-				const nameCol = rowEl.createDiv('importer-column-name-col');
-				const nameInput = nameCol.createEl('input', {
-					type: 'text',
-					cls: 'importer-column-property',
-					value: this.config.propertyNames.get(field.id) || ''
-				});
-				nameInput.addEventListener('input', () => {
-					this.config.propertyNames.set(field.id, nameInput.value);
-				});
+				for (const field of this.fields) {
+					const rowEl = columnContainer.createDiv('importer-column-row');
 
-				// Property value input column
-				const valueCol = rowEl.createDiv('importer-column-value-col');
-				const valueInput = valueCol.createEl('input', {
-					type: 'text',
-					cls: 'importer-column-property',
-					value: this.config.propertyValues.get(field.id) || ''
-				});
-				valueInput.addEventListener('input', () => {
-					this.config.propertyValues.set(field.id, valueInput.value);
-				});
+					const nameCol = rowEl.createDiv('importer-column-name-col');
+					const nameInput = nameCol.createEl('input', {
+						type: 'text',
+						cls: 'importer-column-property',
+						value: this.config.propertyNames.get(field.id) || '',
+					});
+					nameInput.addEventListener('input', () => {
+						this.config.propertyNames.set(field.id, nameInput.value);
+					});
 
-				// Example value column
-				const exampleCol = rowEl.createDiv('importer-column-example-col');
-				const exampleValue = field.exampleValue || '';
-				const truncated = exampleValue.length > 50
-					? exampleValue.substring(0, 50) + '...'
-					: exampleValue;
-				exampleCol.setText(truncated || '—');
+					const valueCol = rowEl.createDiv('importer-column-value-col');
+					const valueInput = valueCol.createEl('input', {
+						type: 'text',
+						cls: 'importer-column-property',
+						value: this.config.propertyValues.get(field.id) || '',
+					});
+					valueInput.addEventListener('input', () => {
+						this.config.propertyValues.set(field.id, valueInput.value);
+					});
 
-				// Delete button column
-				const deleteCol = rowEl.createDiv('importer-column-delete-col');
-				const deleteButton = deleteCol.createEl('button', {
-					cls: 'clickable-icon',
-					attr: { 'aria-label': 'Delete property' }
-				});
-				setIcon(deleteButton, 'trash-2');
-				deleteButton.addEventListener('click', () => {
-					// Remove from configuration
-					this.config.propertyNames.delete(field.id);
-					this.config.propertyValues.delete(field.id);
-					// Remove from UI
-					rowEl.remove();
-				});
+					const exampleCol = rowEl.createDiv('importer-column-example-col');
+					const exampleValue = field.exampleValue || '';
+					const truncated = exampleValue.length > 50
+						? exampleValue.substring(0, 50) + '...'
+						: exampleValue;
+					exampleCol.setText(truncated || '—');
+
+					const deleteCol = rowEl.createDiv('importer-column-delete-col');
+					const deleteButton = deleteCol.createEl('button', {
+						cls: 'clickable-icon',
+						attr: { 'aria-label': i18n.template.actionDeleteProperty() },
+					});
+					setIcon(deleteButton, 'trash-2');
+					deleteButton.addEventListener('click', () => {
+						this.config.propertyNames.delete(field.id);
+						this.config.propertyValues.delete(field.id);
+						rowEl.remove();
+					});
+				}
+			};
+
+			this.configure?.(container, this.config, drawProperties);
+			if (this.showProperties) {
+				propertiesContainer = container.createDiv('importer-template-property-mapping');
+				drawProperties();
 			}
 
 			// Note content template
-			new Setting(container)
-				.setName('Note content')
-				.setDesc('Template for the note content. Use {{field_name}} to insert values.')
-				.addTextArea(text => {
-					text
-						.setPlaceholder('{{Content}}')
-						.setValue(this.config.bodyTemplate)
-						.onChange(value => {
-							this.config.bodyTemplate = value;
-						});
-					text.inputEl.rows = 6;
-				});
+			if (this.showBodyTemplate) {
+				const content = new SettingGroup(container);
+				new Setting(content.listEl)
+					.setName(i18n.template.nameContent())
+					.setDesc(i18n.template.descContent())
+					.addTextArea(text => {
+						text
+							.setPlaceholder('{{Content}}')
+							.setValue(this.config.bodyTemplate)
+							.onChange(value => {
+								this.config.bodyTemplate = value;
+							});
+						text.inputEl.rows = 6;
+					});
+			}
 
-			// Buttons
-			const buttonContainer = container.createDiv('modal-button-container');
-			buttonContainer.createEl('button', { cls: 'mod-cta', text: 'Continue' }, el => {
+			buttonsEl.createEl('button', { cls: 'mod-cta', text: this.actionText }, el => {
 				el.addEventListener('click', () => {
-					// Validate configuration
-					if (!this.config.titleTemplate.trim()) {
-						new Notice('Please provide a note title template.');
+					// Validate configuration (only if title template is shown)
+					if (this.showTitleTemplate && !this.config.titleTemplate.trim()) {
+						new Notice(i18n.template.msgTitleRequired());
 						return;
 					}
 
+					el.remove();
 					resolve(this.config);
-				});
-			});
-
-			buttonContainer.createEl('button', { text: 'Cancel' }, el => {
-				el.addEventListener('click', () => {
-					resolve(null);
 				});
 			});
 		});
@@ -244,8 +279,18 @@ export class TemplateConfigurator {
 export function applyTemplate(template: string, data: Record<string, string>): string {
 	if (!template) return '';
 
-	return template.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (match, fieldName) => {
-		const trimmedName = fieldName.trim();
+	return template.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (match: string, fieldName: string) => {
+		let trimmedName = fieldName.trim();
+		const sourceMatch = /^source\[("(?:\\.|[^"\\])*")\]$/u.exec(trimmedName);
+		if (sourceMatch) {
+			try {
+				const parsed: unknown = JSON.parse(sourceMatch[1]);
+				if (typeof parsed === 'string') trimmedName = parsed;
+			}
+			catch {
+				// Invalid escapes remain available as literal field names.
+			}
+		}
 		return data[trimmedName] !== undefined ? data[trimmedName] : match;
 	});
 }
@@ -319,4 +364,3 @@ export function generateFrontmatter(
 	lines.push('---');
 	return lines.join('\n');
 }
-

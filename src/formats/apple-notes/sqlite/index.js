@@ -66,7 +66,7 @@ const interactiveExec = (bin, args, timeout) => {
 			stdin.write('.quit\n');
 			next = null;
 		} 
-		else if (next) {
+		else if (next !== null) {
 			next = next.then(
 				() => new Promise(done => {
 					let out = '';
@@ -163,7 +163,7 @@ let memory = '';
  * @returns 
  */
 export default function SQLiteTag(db, options = {}) {
-	if (db === ':memory:') db = memory || (memory = path.join(os.tmpdir(), randomUUID()));
+	if (db === ':memory:') db = memory || (memory = path.join(os.tmpdir(), crypto.randomUUID()));
 
 	const timeout = options.timeout || 0;
 	const bin = options.bin || 'sqlite3';

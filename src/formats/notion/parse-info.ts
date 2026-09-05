@@ -4,10 +4,26 @@ import { NotionResolverInfo } from './notion-types';
 import { getNotionId, parseParentIds } from './notion-utils';
 
 export async function parseFileInfo(info: NotionResolverInfo, file: ZipEntryFile) {
+	recordFileInfo(info, {
+		filepath: file.filepath,
+		name: file.name,
+		extension: file.extension,
+		text: file.extension === 'html' ? await file.readText() : undefined,
+	});
+}
+
+export interface NotionExportEntry {
+	filepath: string;
+	name: string;
+	extension: string;
+	text?: string;
+}
+
+export function recordFileInfo(info: NotionResolverInfo, file: NotionExportEntry) {
 	let { filepath } = file;
 
 	if (file.extension === 'html') {
-		const text = await file.readText();
+		const text = file.text ?? '';
 
 		const dom = parseHTML(text);
 		const body = dom.find('body');
@@ -30,7 +46,7 @@ export async function parseFileInfo(info: NotionResolverInfo, file: ZipEntryFile
 		let title = stripTo200(sanitizeFileName(
 			parsedTitle
 				.replace(/\n/g, ' ')
-				.replace(/[:\/]/g, '-')
+				.replace(/[:/]/g, '-')
 				.replace(/#/g, '')
 				.trim()
 		));
@@ -85,7 +101,7 @@ function stripTo200(title: string) {
 // Function to parse the date-time string
 function parseDateTime(dateTimeStr: string): Date | null {
 	// If the string starts with "@", skip the first character
-	const cleanedStr = dateTimeStr.startsWith('@') ? dateTimeStr.substr(1).trim() : dateTimeStr.trim();
+	const cleanedStr = dateTimeStr.startsWith('@') ? dateTimeStr.slice(1).trim() : dateTimeStr.trim();
 
 	// Use the built-in Date constructor
 	const dateObj = new Date(cleanedStr);

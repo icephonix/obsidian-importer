@@ -4,26 +4,31 @@
  */
 
 import { 
-	BlockObjectResponse, 
-	ToggleBlockObjectResponse,
-	TableBlockObjectResponse,
-	TableRowBlockObjectResponse,
-	CalloutBlockObjectResponse,
-	EquationBlockObjectResponse,
-	BookmarkBlockObjectResponse,
-	EmbedBlockObjectResponse,
-	LinkPreviewBlockObjectResponse,
-	CodeBlockObjectResponse,
+	BlockObjectResponse,
 	RichTextItemResponse,
 } from '@notionhq/client';
 import { normalizePath, TFile } from 'obsidian';
 import { parseFilePath } from '../../filesystem';
 import { sanitizeFileName } from '../../util';
-import { getBlockChildren, processBlockChildren } from './api-helpers';
+import { i18n } from '../../i18n';
+
+/** What each kind of attachment is called on screen. */
+function attachmentTypeLabel(type: AttachmentType): string {
+	switch (type) {
+		case AttachmentType.IMAGE:
+			return i18n.importer.notionApi.labelAttachmentImage();
+		case AttachmentType.VIDEO:
+			return i18n.importer.notionApi.labelAttachmentVideo();
+		case AttachmentType.FILE:
+			return i18n.importer.notionApi.labelAttachmentFile();
+		case AttachmentType.PDF:
+			return i18n.importer.notionApi.labelAttachmentPdf();
+	}
+}
+import { getBlockChildren, makeNotionRequest, processBlockChildren } from './api-helpers';
 import { downloadAndFormatAttachment, extractAttachmentFromBlock, getCaptionFromBlock } from './attachment-helpers';
-import { BlockConversionContext, AttachmentType, AttachmentBlockConfig, HeaderContentWithRichTextAndColorResponse } from './types';
+import { BlockConversionContext, AttachmentType, AttachmentBlockConfig, BlockContext, HeaderContentWithRichTextAndColorResponse } from './types';
 import { createPlaceholder, extractPlaceholderIds, PlaceholderType } from './utils';
-import { getUniqueFilePath } from './vault-helpers';
 
 
 /**
@@ -66,7 +71,7 @@ async function processChildrenToMarkdown(
 	block: BlockObjectResponse,
 	context: BlockConversionContext,
 	indentLevel: number | undefined,
-	errorContext: string
+	errorContext: BlockContext
 ): Promise<string | undefined> {
 	return await processBlockChildren({
 		block,
@@ -90,7 +95,7 @@ function isEmptyParagraph(block: BlockObjectResponse | null | undefined): boolea
 	if (!block || block.type !== 'paragraph') {
 		return false;
 	}
-	return block.paragraph.rich_text.length === 0;
+	return block.paragraph.rich_text.length === 0 && !block.has_children;
 }
 
 /**
@@ -107,7 +112,7 @@ async function convertToFoldableCallout(
 	title: string,
 	block: BlockObjectResponse,
 	context: BlockConversionContext,
-	errorContext: string
+	errorContext: BlockContext
 ): Promise<string> {
 	// Default to expanded (+) state
 	const foldState = '+';
@@ -234,7 +239,7 @@ export async function convertBlocksToMarkdown(
 	const lines: string[] = [];
 	
 	for (let i = 0; i < blocks.length; i++) {
-		if (context.ctx.isCancelled()) break;
+		if (await context.ctx.shouldStop()) break;
 		
 		const block = blocks[i];
 		
@@ -296,10 +301,11 @@ export async function convertBlockToMarkdown(
 ): Promise<string> {
 	const type = block.type;
 	let markdown = '';
-	
+
+	// The Notion SDK does not yet type meeting_notes blocks.
 	switch (type) {
 		case 'paragraph':
-			markdown = convertParagraph(block, context);
+			markdown = await convertParagraph(block, context);
 			break;
 		
 		case 'heading_1':
@@ -384,7 +390,7 @@ export async function convertBlockToMarkdown(
 			markdown = convertLinkPreview(block);
 			break;
 		
-		case 'child_database':
+		case 'child_database': {
 			// Database blocks are handled separately in the main importer
 			// Special handling for databases inside synced blocks
 			const isInSyncedBlockDb = context.isProcessingSyncedBlock || false;
@@ -406,8 +412,9 @@ export async function convertBlockToMarkdown(
 				markdown = placeholder;
 			}
 			break;
+		}
 		
-		case 'child_page':
+		case 'child_page': {
 			// Child page blocks: import the page and return a link
 			// Special handling for pages inside synced blocks
 			const isInSyncedBlock = context.isProcessingSyncedBlock || false;
@@ -468,7 +475,7 @@ export async function convertBlockToMarkdown(
 				catch (error) {
 					const errorMsg = error instanceof Error ? error.message : String(error);
 					console.error(`Failed to import child page "${pageTitle}":`, error);
-					context.ctx.reportFailed(`Child page: ${pageTitle}`, errorMsg);
+					context.ctx.reportFailed(i18n.importer.notionApi.labelChildPage({ title: pageTitle }), errorMsg);
 					markdown = `<!-- Failed to import child page: ${errorMsg} -->`;
 				}
 			}
@@ -478,22 +485,127 @@ export async function convertBlockToMarkdown(
 				markdown = '';
 			}
 			break;
+		}
 		
-		default:
-			// Unsupported block type - skip for now
-			console.log(`Unsupported block type: ${type}`);
+		default: {
+			// The SDK does not yet include meeting_notes in its block union.
+			const meetingNotes = asMeetingNotes(block);
+			if (meetingNotes) {
+				markdown = await convertMeetingNotes(block.id, meetingNotes, context);
+				break;
+			}
+
+			console.warn(`Unsupported block type: ${type}`);
 			markdown = '';
+		}
 	}
 	
 	return markdown;
 }
 
-/**
- * Convert paragraph block to Markdown
- */
-export function convertParagraph(block: BlockObjectResponse, context?: BlockConversionContext): string {
+interface MeetingNotesBlock {
+	title?: RichTextItemResponse[];
+	status?: string;
+	children?: {
+		summary_block_id?: string;
+		notes_block_id?: string;
+		transcript_block_id?: string;
+	};
+}
+
+interface MeetingNotesSection {
+	key: keyof NonNullable<MeetingNotesBlock['children']>;
+	heading: string;
+	label: () => string;
+}
+
+const MEETING_NOTES_SECTIONS: MeetingNotesSection[] = [
+	{ key: 'summary_block_id', heading: 'Summary', label: () => i18n.importer.notionApi.sectionSummary() },
+	{ key: 'notes_block_id', heading: 'Notes', label: () => i18n.importer.notionApi.sectionNotes() },
+	{ key: 'transcript_block_id', heading: 'Transcript', label: () => i18n.importer.notionApi.sectionTranscript() },
+];
+
+function asMeetingNotes(block: BlockObjectResponse): MeetingNotesBlock | null {
+	if ((block.type as string) !== 'meeting_notes') return null;
+
+	const data = (block as unknown as Record<string, unknown>).meeting_notes;
+	return typeof data === 'object' && data !== null ? data : null;
+}
+
+async function convertMeetingNotes(
+	blockId: string,
+	meetingNotes: MeetingNotesBlock,
+	context: BlockConversionContext
+): Promise<string> {
+	const title = convertRichText(meetingNotes.title ?? [], context).trim();
+	const name = title || i18n.importer.notionApi.labelUntitledMeeting({ id: blockId.substring(0, 8) });
+
+	// Content is unavailable until Notion marks the notes ready.
+	if (meetingNotes.status && meetingNotes.status !== 'notes_ready') {
+		context.ctx.reportSkipped(
+			i18n.importer.notionApi.labelMeetingNotes({ name }),
+			i18n.importer.notionApi.reasonMeetingNotesPending({ status: meetingNotes.status })
+		);
+		return title ? `## ${title}` : '';
+	}
+
+	const sectionLevel = title ? '###' : '##';
+	const parts: string[] = title ? [`## ${title}`] : [];
+
+	for (const { key, heading, label } of MEETING_NOTES_SECTIONS) {
+		const sectionId = meetingNotes.children?.[key];
+		if (!sectionId) continue;
+
+		try {
+			const children = await getBlockChildren(sectionId, context.client, context.ctx, context.blocksCache);
+			if (children.length === 0) continue;
+
+			// Number lists independently in each section.
+			const content = await convertBlocksToMarkdown(children, { ...context, listCounters: new Map() });
+			if (!content.trim()) continue;
+
+			parts.push(`${sectionLevel} ${heading}`, content);
+		}
+		catch (error) {
+			const errorMsg = error instanceof Error ? error.message : String(error);
+			console.error(`Failed to read the ${heading.toLowerCase()} of meeting notes ${blockId}:`, error);
+			context.ctx.reportFailed(
+				i18n.importer.notionApi.labelMeetingNotesSection({ name, section: label() }),
+				errorMsg
+			);
+		}
+	}
+
+	return parts.join('\n\n');
+}
+
+export async function convertParagraph(block: BlockObjectResponse, context?: BlockConversionContext): Promise<string> {
 	if (block.type !== 'paragraph') return '';
-	return convertRichText(block.paragraph.rich_text, context);
+
+	const indentLevel = context?.indentLevel || 0;
+	const indent = indentLevel > 0 ? '    '.repeat(indentLevel) : '';
+	const text = convertRichText(block.paragraph.rich_text, context);
+
+	if (!text && !block.has_children) {
+		return '';
+	}
+
+	let markdown = text ? (indent + text) : '';
+
+	if (block.has_children && context) {
+		const childrenMarkdown = await processChildrenToMarkdown(
+			block,
+			context,
+			indentLevel + 1,
+			'paragraph'
+		);
+
+		if (childrenMarkdown) {
+			markdown += (markdown ? '\n' : '') + childrenMarkdown;
+		}
+	}
+
+	return markdown;
 }
 
 /**
@@ -687,10 +799,14 @@ async function createSyncedBlockFile(
 	blockId: string,
 	context: BlockConversionContext
 ): Promise<string> {
-	const { client, ctx, vault, currentFolderPath, currentPageTitle } = context;
-	
+	const { client, ctx, currentFolderPath, currentPageTitle, syncedBlockFile } = context;
+
 	if (!currentFolderPath) {
 		throw new Error('currentFolderPath is required for synced blocks');
+	}
+
+	if (!syncedBlockFile) {
+		throw new Error('syncedBlockFile is required for synced blocks');
 	}
 	
 	// Use page title for synced block filename
@@ -700,67 +816,75 @@ async function createSyncedBlockFile(
 	
 	try {
 		// Fetch the block to get its content
-		const retrievedBlock = await client.blocks.retrieve({ block_id: blockId });
+		const retrievedBlock = await makeNotionRequest(
+			() => client.blocks.retrieve({ block_id: blockId }),
+			ctx,
+		);
 		
 		// Check if it's a full block (not partial)
 		if (!('type' in retrievedBlock)) {
 			throw new Error(`Retrieved block ${blockId} is partial, cannot process synced block`);
 		}
 		
-		const block = retrievedBlock as BlockObjectResponse;
+		const block = retrievedBlock;
 		
 		// Get the block's children (the actual content)
 		const children: BlockObjectResponse[] = block.has_children 
 			? await getBlockChildren(blockId, client, ctx, context.blocksCache)
 			: [];
 		
-		// Generate unique file path in the same folder as the page
-		// If multiple synced blocks exist, they will be named: "Page synced block.md", "Page synced block 1.md", etc.
-		const filePath = getUniqueFilePath(vault, currentFolderPath, `${fileName}.md`);
-	
-		// Create a new context for synced block content
-		// Keep currentFolderPath the same so nested synced blocks are also placed correctly
-		// Set isProcessingSyncedBlock flag to indicate we're inside a synced block
-		const syncedBlockContext: BlockConversionContext = {
-			...context,
-			currentFilePath: filePath, // Update current file path for link generation
-			isProcessingSyncedBlock: true // Mark that we're processing synced block content
-		};
-	
-		// Convert children to markdown
-		const markdown = await convertBlocksToMarkdown(children, syncedBlockContext);
+		return await syncedBlockFile({
+			blockId,
+			folderPath: currentFolderPath,
+			fileName: `${fileName}.md`,
+			createdTime: 'created_time' in block ? block.created_time : undefined,
+			lastEditedTime: 'last_edited_time' in block ? block.last_edited_time : undefined,
+			convert: async (filePath, { forChildrenOnly, keepPlaceholders }) => {
+				// Create a new context for synced block content
+				// Keep currentFolderPath the same so nested synced blocks are also placed correctly
+				// Set isProcessingSyncedBlock flag to indicate we're inside a synced block
+				const syncedBlockContext: BlockConversionContext = {
+					...context,
+					currentFilePath: filePath, // Update current file path for link generation
+					isProcessingSyncedBlock: true, // Mark that we're processing synced block content
+					// The block's own answer, not the page's: a note that has to
+					// be written needs what it points at whether or not the page
+					// holding it is being left alone.
+					forChildrenOnly,
+				};
 
-		// Extract synced child IDs from the markdown content
-		// This allows us to efficiently replace placeholders later without scanning all files
-		// Separated by type to avoid unnecessary placeholder checks during replacement
+				// Convert children to markdown
+				const markdown = await convertBlocksToMarkdown(children, syncedBlockContext);
+				if (!keepPlaceholders) return markdown;
 
-		// Find SYNCED_CHILD_PAGE placeholders
-		const pageIds = extractPlaceholderIds(markdown, PlaceholderType.SYNCED_CHILD_PAGE);
-		if (context.syncedChildPagePlaceholders && pageIds.length > 0) {
-			const existingPageIds = context.syncedChildPagePlaceholders.get(filePath) || new Set<string>();
-			pageIds.forEach(id => existingPageIds.add(id));
-			context.syncedChildPagePlaceholders.set(filePath, existingPageIds);
-		}
+				// Extract synced child IDs from the markdown content
+				// This allows us to efficiently replace placeholders later without scanning all files
+				// Separated by type to avoid unnecessary placeholder checks during replacement
 
-		// Find SYNCED_CHILD_DATABASE placeholders
-		const dbIds = extractPlaceholderIds(markdown, PlaceholderType.SYNCED_CHILD_DATABASE);
-		if (context.syncedChildDatabasePlaceholders && dbIds.length > 0) {
-			const existingDbIds = context.syncedChildDatabasePlaceholders.get(filePath) || new Set<string>();
-			dbIds.forEach(id => existingDbIds.add(id));
-			context.syncedChildDatabasePlaceholders.set(filePath, existingDbIds);
-		}
-	
-		// Create the file
-		await vault.create(filePath, markdown);
-		
-		console.log(`Created synced block file: ${filePath}`);
-		
-		return filePath;
+				// Find SYNCED_CHILD_PAGE placeholders
+				const pageIds = extractPlaceholderIds(markdown, PlaceholderType.SYNCED_CHILD_PAGE);
+				if (context.syncedChildPagePlaceholders && pageIds.length > 0) {
+					const existingPageIds = context.syncedChildPagePlaceholders.get(filePath) || new Set<string>();
+					pageIds.forEach(id => existingPageIds.add(id));
+					context.syncedChildPagePlaceholders.set(filePath, existingPageIds);
+				}
+
+				// Find SYNCED_CHILD_DATABASE placeholders
+				const dbIds = extractPlaceholderIds(markdown, PlaceholderType.SYNCED_CHILD_DATABASE);
+				if (context.syncedChildDatabasePlaceholders && dbIds.length > 0) {
+					const existingDbIds = context.syncedChildDatabasePlaceholders.get(filePath) || new Set<string>();
+					dbIds.forEach(id => existingDbIds.add(id));
+					context.syncedChildDatabasePlaceholders.set(filePath, existingDbIds);
+				}
+
+				return markdown;
+			},
+		});
 	}
 	catch (error) {
 		const errorMsg = error instanceof Error ? error.message : String(error);
 		console.error(`Failed to create synced block file "${fileName}":`, error);
-		context.ctx.reportFailed(`Synced block: ${fileName}`, errorMsg);
+		context.ctx.reportFailed(i18n.importer.notionApi.labelSyncedBlock({ name: fileName }), errorMsg);
 		throw error;
 	}
 }
@@ -786,7 +910,6 @@ export async function convertSyncedBlock(
 	
 	// Determine if this is an original block or a synced copy
 	const isOriginal = syncedBlockData.synced_from === null;
-	// If don't use the ! assertion, TypeScript will throw an error.
 	const originalBlockId = isOriginal ? block.id : syncedBlockData.synced_from!.block_id;
 	
 	// Check if we already have a file for this synced block
@@ -835,8 +958,7 @@ export async function convertToggle(
 ): Promise<string> {
 	if (block.type !== 'toggle') return '';
 	
-	const toggleBlock = block as ToggleBlockObjectResponse;
-	const toggleData = toggleBlock.toggle;
+	const toggleData = block.toggle;
 	
 	// Get toggle text
 	const text = convertRichText(toggleData.rich_text, context);
@@ -855,8 +977,7 @@ export async function convertTable(
 ): Promise<string> {
 	if (block.type !== 'table') return '';
 	
-	const tableBlock = block as TableBlockObjectResponse;
-	const tableData = tableBlock.table;
+	const tableData = block.table;
 	
 	// Table configuration
 	const tableWidth = tableData.table_width || 0;
@@ -879,8 +1000,7 @@ export async function convertTable(
 				const row = rows[rowIndex];
 				if (row.type !== 'table_row') continue;
 				
-				const rowBlock = row as TableRowBlockObjectResponse;
-				const rowData = rowBlock.table_row;
+				const rowData = row.table_row;
 				if (!rowData.cells) continue;
 				
 				const cells = rowData.cells; // Array of RichText arrays
@@ -1007,8 +1127,7 @@ export async function convertQuote(block: BlockObjectResponse, context: BlockCon
 export async function convertCallout(block: BlockObjectResponse, context: BlockConversionContext): Promise<string> {
 	if (block.type !== 'callout') return '';
 	
-	const calloutBlock = block as CalloutBlockObjectResponse;
-	const calloutData = calloutBlock.callout;
+	const calloutData = block.callout;
 	
 	// Get callout icon and text
 	const icon = (calloutData.icon && 'emoji' in calloutData.icon) ? calloutData.icon.emoji : '📌';
@@ -1062,8 +1181,7 @@ export function convertDivider(block: BlockObjectResponse): string {
 export function convertEquation(block: BlockObjectResponse): string {
 	if (block.type !== 'equation') return '';
 	
-	const equationBlock = block as EquationBlockObjectResponse;
-	const equationData = equationBlock.equation;
+	const equationData = block.equation;
 	if (!equationData.expression) return '';
 	
 	// Obsidian uses $$ for block-level math
@@ -1076,8 +1194,7 @@ export function convertEquation(block: BlockObjectResponse): string {
 export function convertCode(block: BlockObjectResponse, context?: BlockConversionContext): string {
 	if (block.type !== 'code') return '';
 	
-	const codeBlock = block as CodeBlockObjectResponse;
-	const codeData = codeBlock.code;
+	const codeData = block.code;
 	if (!codeData) return '';
 	
 	// Get code content from rich_text - use plain_text to avoid formatting in code blocks
@@ -1125,7 +1242,7 @@ async function convertAttachmentBlock(
 	catch (error) {
 		const errorMsg = error instanceof Error ? error.message : String(error);
 		console.error(`Failed to convert ${type} block:`, error);
-		context.ctx.reportFailed(`${type.charAt(0).toUpperCase() + type.slice(1)} attachment`, errorMsg);
+		context.ctx.reportFailed(attachmentTypeLabel(type), errorMsg);
 		
 		// If download failed, return a fallback markdown link with the original URL
 		const linkText = caption || attachment.name || fallbackText;
@@ -1184,11 +1301,6 @@ export async function convertPdf(block: BlockObjectResponse, context: BlockConve
 	return convertAttachmentBlock(block, context, ATTACHMENT_CONFIGS[AttachmentType.PDF]);
 }
 
-/**
- * Check if URL is embeddable in Obsidian
- * Obsidian supports embedding YouTube and Twitter/X content
- * @see https://help.obsidian.md/embed-web-pages
- */
 function isEmbeddableUrl(url: string): boolean {
 	return url.includes('youtube.com') || 
 	       url.includes('youtu.be') || 
@@ -1203,8 +1315,7 @@ function isEmbeddableUrl(url: string): boolean {
 export function convertBookmark(block: BlockObjectResponse): string {
 	if (block.type !== 'bookmark') return '';
 	
-	const bookmarkBlock = block as BookmarkBlockObjectResponse;
-	const bookmarkData = bookmarkBlock.bookmark;
+	const bookmarkData = block.bookmark;
 	
 	const url = bookmarkData.url || '';
 	const caption = getCaptionFromBlock(block);
@@ -1224,8 +1335,7 @@ export function convertBookmark(block: BlockObjectResponse): string {
 export function convertEmbed(block: BlockObjectResponse): string {
 	if (block.type !== 'embed') return '';
 	
-	const embedBlock = block as EmbedBlockObjectResponse;
-	const embedData = embedBlock.embed;
+	const embedData = block.embed;
 	
 	const url = embedData.url || '';
 	const caption = getCaptionFromBlock(block);
@@ -1249,8 +1359,7 @@ export function convertEmbed(block: BlockObjectResponse): string {
 export function convertLinkPreview(block: BlockObjectResponse): string {
 	if (block.type !== 'link_preview') return '';
 	
-	const linkPreviewBlock = block as LinkPreviewBlockObjectResponse;
-	const linkPreviewData = linkPreviewBlock.link_preview;
+	const linkPreviewData = block.link_preview;
 	
 	const url = linkPreviewData.url || '';
 	
@@ -1351,7 +1460,7 @@ function convertMention(richText: any, context?: BlockConversionContext): string
 			}
 			return createPlaceholder(PlaceholderType.NOTION_PAGE, mention.page.id);
 		
-		case 'date':
+		case 'date': {
 			// Render date as plain text with spaces
 			const dateObj = mention.date;
 			let dateText = '';
@@ -1362,15 +1471,17 @@ function convertMention(richText: any, context?: BlockConversionContext): string
 				}
 			}
 			return ` ${dateText} `;
+		}
 		
-		case 'link_mention':
+		case 'link_mention': {
 			// Render as external link
 			const url = mention.link_mention?.href || '';
 			// Prioritize link_mention.title, fallback to plain_text, then URL
 			const title = mention.link_mention?.title || richText.plain_text || url;
 			return `[${title}](${url})`;
+		}
 		
-		case 'user':
+		case 'user': {
 			// Render user as markdown link with email if available
 			const user = mention.user;
 			if (user) {
@@ -1384,11 +1495,12 @@ function convertMention(richText: any, context?: BlockConversionContext): string
 			// Fallback to plain text
 			const userName = richText.plain_text || '';
 			return ` ${userName} `;
+		}
 		
-		default:
+		default: {
 			// For any other mention types, render as plain text with spaces
 			const text = richText.plain_text || '';
 			return ` ${text} `;
+		}
 	}
 }
-

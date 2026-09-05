@@ -1,36 +1,6 @@
-/**
- * Formula converter for Notion to Obsidian Bases
- * 
- * This converter intelligently transforms Notion's function-based syntax
- * to Obsidian Base's syntax.
- * 
- * Key transformations:
- * - prop("Name") -> note["Name"]
- * - length() has two forms in Notion:
- *   1. Method: .length() (everywhere, including in map/filter)
- *      Examples: prop("Title").length() -> note["Title"].length
- *                current.length() -> value.length
- *   2. Function: length(x) -> (x).length
- * - abs(x) -> (x).abs() (method call)
- * - contains(x, y) -> (x).contains(y) (method call)
- * - unique(x) -> (x).unique() (method call)
- * - Global functions stay as-is: if()
- * 
- * Important notes:
- * - length in Obsidian is a PROPERTY, not a method or function
- *   .length() method calls are converted to .length property access
- *   length(x) function calls are converted to (x).length
- * - unique() is a METHOD (x.unique()), not a global function
- * - sum(), mean(), median(), max(), min() are converted to list methods with flat()
- *   to support both multi-arg and array forms (e.g., max(1,2,3) and max([1,2,3]))
- * - Many date/time functions are not supported
- * 
- * Based on:
- * - Notion: https://www.notion.com/help/formula-syntax
- * - Obsidian: https://help.obsidian.md/bases/functions
- */
 
 import { ConversionInfo } from './types';
+import { findMatchingParen, parseArguments } from '../../formula-utils';
 
 const FUNCTION_MAPPING: Record<string, ConversionInfo> = {
 	// Global functions (same in both Notion and Obsidian)
@@ -224,10 +194,6 @@ export function canConvertFormula(notionFormula: string): boolean {
  * 
  * @param notionFormula - The formula expression (may contain placeholders)
  * @param properties - The database properties schema (to resolve property IDs to names)
- */
-/**
- * Convert Notion formula to Obsidian Dataview formula
- * @param properties - Using 'any' because property configurations have different structures by type
  */
 export function convertNotionFormulaToObsidian(
 	notionFormula: string,
@@ -494,62 +460,6 @@ export function convertNotionFormulaToObsidian(
 }
 
 /**
- * Parse comma-separated arguments
- * This is a simple parser that doesn't handle nested parentheses well,
- * but works for the common cases after we've processed inner functions
- */
-function parseArguments(argsStr: string): string[] {
-	if (!argsStr.trim()) {
-		return [];
-	}
-	
-	const args: string[] = [];
-	let current = '';
-	let depth = 0;
-	let inString = false;
-	let stringChar = '';
-	
-	for (let i = 0; i < argsStr.length; i++) {
-		const char = argsStr[i];
-		
-		if (inString) {
-			current += char;
-			if (char === stringChar && argsStr[i - 1] !== '\\') {
-				inString = false;
-			}
-		}
-		else {
-			if (char === '"' || char === '\'') {
-				inString = true;
-				stringChar = char;
-				current += char;
-			}
-			else if (char === '(' || char === '[') {
-				depth++;
-				current += char;
-			}
-			else if (char === ')' || char === ']') {
-				depth--;
-				current += char;
-			}
-			else if (char === ',' && depth === 0) {
-				args.push(current.trim());
-				current = '';
-			}
-			else {
-				current += char;
-			}
-		}
-	}
-	
-	if (current.trim()) {
-		args.push(current.trim());
-	}
-	
-	return args;
-}
-
-/**
  * Convert Notion date arithmetic functions to Obsidian syntax
  * @param argsStr - Arguments string from the function call
  * @param operator - The arithmetic operator ('+' for dateAdd, '-' for dateSubtract)
@@ -586,46 +496,6 @@ function convertDateArithmetic(argsStr: string, operator: '+' | '-'): string | n
 	
 	// Convert: date ± 'amount+unit'
 	return `(${dateArg}) ${operator} '${amountArg}${obsidianUnit}'`;
-}
-
-/**
- * Find the matching closing parenthesis for an opening parenthesis
- * @param str - The string to search in
- * @param openPos - The position of the opening parenthesis
- * @returns The position of the matching closing parenthesis, or -1 if not found
- */
-function findMatchingParen(str: string, openPos: number): number {
-	let depth = 1;
-	let inString = false;
-	let stringChar = '';
-	
-	for (let i = openPos + 1; i < str.length; i++) {
-		const char = str[i];
-		const prevChar = i > 0 ? str[i - 1] : '';
-		
-		if (inString) {
-			if (char === stringChar && prevChar !== '\\') {
-				inString = false;
-			}
-		}
-		else {
-			if (char === '"' || char === '\'') {
-				inString = true;
-				stringChar = char;
-			}
-			else if (char === '(') {
-				depth++;
-			}
-			else if (char === ')') {
-				depth--;
-				if (depth === 0) {
-					return i;
-				}
-			}
-		}
-	}
-	
-	return -1; // No matching parenthesis found
 }
 
 /**

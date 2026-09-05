@@ -1,47 +1,98 @@
 import { normalizePath, Notice, TFolder, Platform } from 'obsidian';
 import { parseFilePath, NodePickedFolder, NodePickedFile, PickedFile, PickedFolder } from '../filesystem';
-import { FormatImporter } from '../format-importer';
-import { ProgressReporter } from '../main';
-import { readZip, ZipEntryFile } from 'zip';
-
-const assetMatcher = /!\[\]\(assets\/([^)]*)\)/g;
+import { FormatImporter, NoteTemplateSample, TEMPLATE_PREVIEW_LIMIT } from '../format-importer';
+import { ImportContext } from '../import-context';
+import { i18n } from '../i18n';
+import { readZip, ZipEntryFile } from '../zip';
+import { bundleNoteName, convertTextbundleNote, groupFilesByTextbundle, isMarkdownBundle } from './textbundle/convert';
 
 export class TextbundleImporter extends FormatImporter {
+	// macOS pickers expose .textbundle directories as files.
+	static extensions = Platform.isMacOS
+		? ['textbundle', 'textpack', 'zip']
+		: ['textpack', 'zip'];
+
+	interruption = 'pause' as const;
+
 	private attachmentsFolderPath: TFolder;
 
 	init() {
 		if (!Platform.isMacOS) {
-			this.modal.contentEl.createEl('p', {
-				text:
-					'Due to platform limitations, only textpack and zip files can be imported from this device.' +
-					' Open your vault on a Mac to import textbundle files.'
-			});
+			this.draw(contentEl => contentEl.createEl('p', {
+				text: i18n.importer.textbundle.msgPlatform(),
+			}), 'source');
 		}
 
-		const formats = Platform.isMacOS
-			? ['textbundle', 'textpack', 'zip']
-			: ['textpack', 'zip'];
-
-		this.addFileChooserSetting('Textbundle', formats, true);
-		this.addOutputLocationSetting('Textbundle');
+		this.addExportSetting(i18n.importer.textbundle.descExport());
+		this.addFileChooserSetting(i18n.importer.textbundle.fileType(), TextbundleImporter.extensions, true);
+		this.defaultOutputFolder = 'Textbundle';
 	}
 
-	async import(progress: ProgressReporter): Promise<void> {
+	protected override async templatePreviewSamples(ctx: ImportContext): Promise<NoteTemplateSample[]> {
+		const samples: NoteTemplateSample[] = [];
+		const sampleEntries = async (
+			bundleName: string,
+			entries: (PickedFile | PickedFolder | ZipEntryFile)[],
+		): Promise<void> => {
+			const info = entries.find(entry => entry.type === 'file' && entry.name === 'info.json') as PickedFile | undefined;
+			if (info && !isMarkdownBundle(await info.readText())) return;
+
+			for (const entry of entries) {
+				if (samples.length >= TEMPLATE_PREVIEW_LIMIT || await ctx.shouldStop()) break;
+				if (entry.type !== 'file' || (entry.extension !== 'md' && entry.extension !== 'markdown')) continue;
+				const title = bundleNoteName('parent' in entry ? entry.parent : bundleName);
+				samples.push({
+					title,
+					path: normalizePath(`${this.outputLocation}/${title}.md`),
+					content: convertTextbundleNote(await entry.readText(), 'Attachments'),
+				});
+			}
+		};
+
+		for (const file of this.files) {
+			if (samples.length >= TEMPLATE_PREVIEW_LIMIT || await ctx.shouldStop()) break;
+			try {
+				if (file.extension === 'textpack') {
+					await readZip(file, async (_zip, entries) => sampleEntries(file.name, entries));
+				}
+				else if (file.extension === 'zip') {
+					await readZip(file, async (_zip, entries) => {
+						for (const textbundle of groupFilesByTextbundle(file.name, entries)) {
+							if (samples.length >= TEMPLATE_PREVIEW_LIMIT || await ctx.shouldStop()) break;
+							await sampleEntries(file.name, textbundle);
+						}
+					});
+				}
+				else {
+					await sampleEntries(file.name, await new NodePickedFolder(`${file.toString()}/`).list());
+				}
+			}
+			catch (error) {
+				console.warn(`Could not preview Textbundle ${file.fullpath}`, error);
+			}
+		}
+		return samples;
+	}
+
+	async import(progress: ImportContext): Promise<void> {
 		let { files } = this;
 		if (files.length === 0) {
-			new Notice('Please pick at least one file to import.');
+			new Notice(i18n.common.msgPickFile());
 			return;
 		}
 
 		let folder = await this.getOutputFolder();
 		if (!folder) {
-			new Notice('Please select a location to export to.');
+			new Notice(i18n.common.msgPickOutput());
 			return;
 		}
 
-		this.attachmentsFolderPath = await this.createFolders(`${folder.path}/assets`);
+		const attachmentProbe = await this.getAvailablePathForAttachment('attachment', [], `${folder.path}/Textbundle.md`);
+		this.attachmentsFolderPath = await this.createFolders(parseFilePath(attachmentProbe).parent);
 
 		for (let file of files) {
+			if (await progress.shouldStop()) return;
+
 			if (file.extension === 'textpack') {
 				await readZip(file, async (zip, entries) => {
 					await this.process(progress, file.name, entries);
@@ -49,8 +100,9 @@ export class TextbundleImporter extends FormatImporter {
 			}
 			else if (file.extension === 'zip') {
 				await readZip(file, async (zip, entries) => {
-					const textbundles = this.groupFilesByTextbundle(file.name, entries);
+					const textbundles = groupFilesByTextbundle(file.name, entries);
 					for (const textbundle of textbundles) {
+						if (await progress.shouldStop()) return;
 						await this.process(progress, file.name, textbundle);
 					}
 				});
@@ -63,60 +115,17 @@ export class TextbundleImporter extends FormatImporter {
 		}
 	}
 
-	groupFilesByTextbundle(zipName: string, entries: ZipEntryFile[]): ZipEntryFile[][] {
-		const buckets: Record<string, ZipEntryFile[]> = {};
-		const prefix = zipName + '/';
-		const dotTextbundle = '.textbundle';
-		for (const entry of entries) {
-			if (!entry.fullpath.startsWith(prefix)) {
-				console.log('Skipping', entry.fullpath);
-				continue;
-			}
-
-			const path = entry.fullpath.slice(prefix.length);
-			if (path.startsWith('._') || path.startsWith('__MACOSX')) {
-				console.log('Skipping', entry.fullpath);
-				continue;
-			}
-
-			const idx = path.indexOf(dotTextbundle);
-			if (idx === -1) {
-				console.log('Skipping', entry.fullpath);
-				continue;
-			}
-
-			const textBundle = path.slice(0, idx) + '.textbundle';
-			const rest = path.slice(idx + dotTextbundle.length + 1); // Skip the '.textbundle' and path separator
-
-			if (rest.startsWith('._')) {
-				console.log('Skipping', entry.fullpath);
-				continue;
-			}
-
-			if (textBundle in buckets) {
-				buckets[textBundle].push(entry);
-			}
-			else {
-				buckets[textBundle] = [entry];
-			}
-		}
-
-		return Object.values(buckets);
-	}
-
-	async process(progress: ProgressReporter, bundleName: string, entries: (PickedFile | PickedFolder | ZipEntryFile)[]) {
+	async process(progress: ImportContext, bundleName: string, entries: (PickedFile | PickedFolder | ZipEntryFile)[]) {
 		// First look for the info.json and check that the file type is Markdown
 		const infojson = entries.find((entry) => entry.name === 'info.json');
-		if (infojson) {
-			const text = await (infojson as NodePickedFile).readText();
-			const parsed = JSON.parse(text);
-			if (parsed.hasOwnProperty('type') && parsed.type !== 'net.daringfireball.markdown') {
-				progress.reportSkipped(bundleName, 'The textbundle does not contain markdown');
-				return;
-			}
+		if (infojson && !isMarkdownBundle(await (infojson as NodePickedFile).readText())) {
+			progress.reportSkipped(bundleName, i18n.importer.textbundle.reasonNoMarkdown());
+			return;
 		}
 
 		for (let entry of entries) {
+			if (await progress.shouldStop()) return;
+
 			if (entry.name.startsWith('._')) {
 				// We don't need to notify users that we're skipping these hidden files.
 				// progress.reportSkipped(entry.name, 'skipping system file.');
@@ -125,21 +134,16 @@ export class TextbundleImporter extends FormatImporter {
 
 			try {
 				if (entry.type === 'file' && (entry.extension === 'md' || entry.extension === 'markdown')) {
-					let mdFilename = 'parent' in entry
-						? entry.parent
-						: bundleName;
-					mdFilename = mdFilename.replace(/.textbundle$/, '');
+					const mdFilename = bundleNoteName('parent' in entry ? entry.parent : bundleName);
 
-					let mdContent = await (entry as NodePickedFile).readText();
-					if (mdContent.match(assetMatcher)) {
-						// Replace asset paths with new asset folder path.
-						mdContent = mdContent.replace(assetMatcher, `![[${this.attachmentsFolderPath.path}/$1]]`);
-					}
+					const mdContent = convertTextbundleNote(
+						await (entry as NodePickedFile).readText(),
+						this.attachmentsFolderPath.path);
 					let filePath = normalizePath(mdFilename);
 					const outputFolder = await this.getOutputFolder();
 					// We already asserted previously that the result from getOutputFolder is not null.
-					await this.saveAsMarkdownFile(outputFolder!, filePath, mdContent);
-					progress.reportNoteSuccess(mdFilename);
+					const { written } = await this.writeNote(progress, outputFolder!, filePath, mdContent);
+					if (written) progress.reportNoteSuccess(mdFilename);
 				}
 				else if (entry.type === 'file' && entry.fullpath.contains('assets/')) {
 					await this.importAsset(progress, entry);
@@ -157,7 +161,7 @@ export class TextbundleImporter extends FormatImporter {
 					}
 				}
 				else if (entry.name !== 'info.json') {
-					progress.reportSkipped(entry.name, 'the file is not a media or markdown file.');
+					progress.reportSkipped(entry.name, i18n.importer.textbundle.reasonNotMedia());
 				}
 			}
 			catch (e) {
@@ -166,16 +170,17 @@ export class TextbundleImporter extends FormatImporter {
 		}
 	}
 
-	async importAsset(progress: ProgressReporter, entry: PickedFile | PickedFolder | ZipEntryFile): Promise<void> {
+	async importAsset(progress: ImportContext, entry: PickedFile | PickedFolder | ZipEntryFile): Promise<void> {
 		if (entry.type === 'folder') {
 			progress.reportSkipped(entry.name);
 			return;
 		}
 
-		let assetFileVaultPath = `${this.attachmentsFolderPath.path}/${entry.name}`;
+		let assetFileVaultPath = normalizePath(`${this.attachmentsFolderPath.path}/${entry.name}`);
 		let existingFile = this.vault.getAbstractFileByPath(assetFileVaultPath);
 		if (existingFile) {
-			progress.reportSkipped(entry.name, 'the file already exists.');
+			progress.reportSkipped(entry.name, i18n.importer.textbundle.reasonAlreadyExists());
+			return;
 		}
 
 		let assetData = await entry.read();

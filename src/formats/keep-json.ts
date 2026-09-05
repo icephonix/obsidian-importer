@@ -1,11 +1,14 @@
-import { FrontMatterCache, Notice, Setting, TFolder } from 'obsidian';
+import { Notice, TFolder } from 'obsidian';
 import { PickedFile } from '../filesystem';
-import { FormatImporter } from '../format-importer';
-import { ATTACHMENT_EXTS, ImportContext } from '../main';
-import { serializeFrontMatter } from '../util';
+import { FormatImporter, NoteTemplateSample, NoteWritten, TEMPLATE_PREVIEW_LIMIT } from '../format-importer';
+import { ATTACHMENT_EXTS } from '../constants';
+import { ImportContext } from '../import-context';
+import { i18n } from '../i18n';
 import { readZip, ZipEntryFile } from '../zip';
-import { KeepJson } from './keep/models';
-import { sanitizeTag, sanitizeTags, toSentenceCase } from './keep/util';
+import { sameBytes } from '../util';
+import { hasValidKeepTimestamps, KeepJson } from './keep/models';
+import { convertKeepNote, keepTemplateVariables } from './keep/convert';
+
 
 
 const BUNDLE_EXTS = ['zip'];
@@ -17,17 +20,27 @@ const NOTE_EXTS = ['json'];
 const ZIP_IGNORED_EXTS = ['html', 'txt'];
 
 export class KeepImporter extends FormatImporter {
-	importArchivedSetting: Setting;
-	importTrashedSetting: Setting;
+	// Attachments are accepted by the picker but do not identify a Keep export.
+	static extensions = [...BUNDLE_EXTS, ...NOTE_EXTS];
+
+	interruption = 'pause' as const;
+
 	importArchived: boolean = false;
 	importTrashed: boolean = false;
+	private attachmentPaths = new Map<string, string>();
 
 	init() {
-		this.addFileChooserSetting('Notes & attachments', [...BUNDLE_EXTS, ...NOTE_EXTS, ...ATTACHMENT_EXTS], true);
+		this.addExportSetting(i18n.importer.keep.descExport())
+			?.addButton(button => button
+				.setButtonText(i18n.common.buttonOpen())
+				.setCta()
+				.onClick(() => window.open('https://takeout.google.com/settings/takeout')));
 
-		this.importArchivedSetting = new Setting(this.modal.contentEl)
-			.setName('Import archived notes')
-			.setDesc('If imported, files archived in Google Keep will be tagged as archived.')
+		this.addFileChooserSetting(i18n.importer.keep.fileType(), [...KeepImporter.extensions, ...ATTACHMENT_EXTS], true);
+
+		this.addSetting()
+			?.setName(i18n.importer.keep.nameArchived())
+			.setDesc(i18n.importer.keep.descArchived())
 			.addToggle(toggle => {
 				toggle.setValue(this.importArchived);
 				toggle.onChange(async (value) => {
@@ -35,9 +48,9 @@ export class KeepImporter extends FormatImporter {
 				});
 			});
 
-		this.importTrashedSetting = new Setting(this.modal.contentEl)
-			.setName('Import deleted notes')
-			.setDesc('If imported, files deleted in Google Keep will be tagged as deleted. Deleted notes will only exist in your Google export if deleted recently.')
+		this.addSetting()
+			?.setName(i18n.importer.keep.nameDeleted())
+			.setDesc(i18n.importer.keep.descDeleted())
 			.addToggle(toggle => {
 				toggle.setValue(this.importTrashed);
 				toggle.onChange(async (value) => {
@@ -45,45 +58,102 @@ export class KeepImporter extends FormatImporter {
 				});
 			});
 
-		this.addOutputLocationSetting('Google Keep');
+		this.defaultOutputFolder = 'Google Keep';
 
 	}
 
 	async import(ctx: ImportContext): Promise<void> {
 		let { files } = this;
+		this.attachmentPaths.clear();
 
 		if (files.length === 0) {
-			new Notice('Please pick at least one file to import.');
+			new Notice(i18n.common.msgPickFile());
 			return;
 		}
 
 		let folder = await this.getOutputFolder();
 		if (!folder) {
-			new Notice('Please select a location to import your files to.');
+			new Notice(i18n.common.msgPickImportLocation());
 			return;
 		}
-		let assetFolderPath = `${folder.path}/Assets`;
+		await this.handleFiles(files, folder, ctx);
+	}
 
-		for (let file of files) {
-			if (ctx.isCancelled()) return;
-			await this.handleFile(file, folder, assetFolderPath, ctx);
+	protected override async templatePreviewSamples(ctx: ImportContext): Promise<NoteTemplateSample[]> {
+		const samples: NoteTemplateSample[] = [];
+		const addFile = async (file: PickedFile): Promise<void> => {
+			if (samples.length >= TEMPLATE_PREVIEW_LIMIT || file.extension !== 'json') return;
+			try {
+				const note: unknown = JSON.parse(await file.readText());
+				if (!hasValidKeepTimestamps(note)) return;
+				if (note.isArchived && !this.importArchived) return;
+				if (note.isTrashed && !this.importTrashed) return;
+
+				const strictLineBreaks = this.vault.getConfig('strictLineBreaks') === true;
+				const { content, ctime, mtime } = convertKeepNote(
+					note,
+					file.basename,
+					strictLineBreaks,
+					sourcePath => sourcePath,
+				);
+				samples.push({
+					title: file.basename,
+					path: this.sanitizeFilePath(`${this.outputLocation}/${file.basename}.md`),
+					content,
+					variables: keepTemplateVariables(note),
+					times: { ctime, mtime },
+				});
+			}
+			catch (error) {
+				console.warn(`Could not preview Google Keep file ${file.fullpath}`, error);
+			}
+		};
+
+		for (const file of this.files) {
+			if (samples.length >= TEMPLATE_PREVIEW_LIMIT || await ctx.shouldStop()) break;
+			if (file.extension === 'zip') {
+				await readZip(file, async (_zip, entries) => {
+					for (const entry of entries) {
+						if (samples.length >= TEMPLATE_PREVIEW_LIMIT || await ctx.shouldStop()) break;
+						await addFile(entry);
+					}
+				});
+			}
+			else {
+				await addFile(file);
+			}
+		}
+		return samples;
+	}
+
+	async handleFiles(files: PickedFile[], folder: TFolder, ctx: ImportContext): Promise<void> {
+		// Attachments first, so note links can point at their final collision-free paths.
+		for (const file of files) {
+			if (await ctx.shouldStop()) return;
+			if (!ATTACHMENT_EXTS.contains(file.extension)) continue;
+			try {
+				await this.importAttachment(file, folder, ctx);
+			}
+			catch (error) {
+				ctx.reportFailed(file.fullpath, error);
+			}
+		}
+
+		for (const file of files) {
+			if (await ctx.shouldStop()) return;
+			if (!ATTACHMENT_EXTS.contains(file.extension)) await this.handleFile(file, folder, ctx);
 		}
 	}
 
-	async handleFile(file: PickedFile, folder: TFolder, assetFolderPath: string, ctx: ImportContext) {
+	async handleFile(file: PickedFile, folder: TFolder, ctx: ImportContext) {
 		let { fullpath, name, extension } = file;
-		ctx.status('Processing ' + name);
+		ctx.status(i18n.common.statusProcessing({ name }));
 		try {
 			if (extension === 'zip') {
-				await this.readZipEntries(file, folder, assetFolderPath, ctx);
+				await this.readZipEntries(file, folder, ctx);
 			}
 			else if (extension === 'json') {
 				await this.importKeepNote(file, folder, ctx);
-			}
-			else if (ATTACHMENT_EXTS.contains(extension)) {
-				ctx.status('Importing attachment ' + name);
-				await this.copyFile(file, assetFolderPath);
-				ctx.reportAttachmentSuccess(fullpath);
 			}
 			// Don't mention skipped files when parsing zips, because
 			else if (!(file instanceof ZipEntryFile) && !ZIP_IGNORED_EXTS.contains(extension)) {
@@ -95,118 +165,69 @@ export class KeepImporter extends FormatImporter {
 		}
 	}
 
-	async readZipEntries(file: PickedFile, folder: TFolder, assetFolderPath: string, ctx: ImportContext) {
+	async readZipEntries(file: PickedFile, folder: TFolder, ctx: ImportContext) {
 		await readZip(file, async (zip, entries) => {
-			for (let entry of entries) {
-				if (ctx.isCancelled()) return;
-				await this.handleFile(entry, folder, assetFolderPath, ctx);
-			}
+			await this.handleFiles(entries, folder, ctx);
 		});
 	}
 
 	async importKeepNote(file: PickedFile, folder: TFolder, ctx: ImportContext) {
 		let { fullpath, basename } = file;
-		ctx.status('Importing note ' + basename);
+		ctx.status(i18n.common.statusImportingNote({ name: basename }));
 
 		let content = await file.readText();
 
-		const keepJson = JSON.parse(content) as KeepJson;
-		if (!keepJson || !keepJson.userEditedTimestampUsec || !keepJson.createdTimestampUsec) {
-			ctx.reportFailed(fullpath, 'Invalid Google Keep JSON');
+		const keepJson: unknown = JSON.parse(content);
+		if (!hasValidKeepTimestamps(keepJson)) {
+			ctx.reportFailed(fullpath, i18n.importer.keep.reasonInvalidJson());
 			return;
 		}
 		if (keepJson.isArchived && !this.importArchived) {
-			ctx.reportSkipped(fullpath, 'Archived note');
+			ctx.reportSkipped(fullpath, i18n.importer.keep.reasonArchived());
 			return;
 		}
 		if (keepJson.isTrashed && !this.importTrashed) {
-			ctx.reportSkipped(fullpath, 'Deleted note');
+			ctx.reportSkipped(fullpath, i18n.importer.keep.reasonDeleted());
 			return;
 		}
 
-		await this.convertKeepJson(keepJson, folder, basename);
-		ctx.reportNoteSuccess(fullpath);
+		const { written } = await this.convertKeepJson(ctx, keepJson, folder, basename);
+		if (written) ctx.reportNoteSuccess(fullpath);
 	}
 
-	// Keep assets have filenames that appear unique, so no duplicate handling isn't implemented
-	async copyFile(file: PickedFile, folderPath: string) {
-		let assetFolder = await this.createFolders(folderPath);
-		let data = await file.read();
-		await this.vault.createBinary(`${assetFolder.path}/${file.name}`, data);
+	async importAttachment(file: PickedFile, folder: TFolder, ctx: ImportContext): Promise<void> {
+		ctx.status(i18n.common.statusImportingAttachment({ name: file.name }));
+		const notePath = `${folder.path}/Keep.md`;
+		const data = await file.read();
+		const { path: outputPath, reuse } = await this.placeAttachment(file.name, notePath, async existing => {
+			if (existing.stat.size !== data.byteLength) return 'another';
+
+			return sameBytes(await this.vault.readBinary(existing), data) ? 'same' : 'another';
+		});
+
+		this.attachmentPaths.set(file.name, outputPath);
+		this.attachmentPaths.set(file.fullpath, outputPath);
+		if (reuse) {
+			ctx.reportSkipped(file.fullpath, i18n.reason.alreadyInVault());
+			return;
+		}
+
+		await this.writeAttachment(outputPath, data);
+		ctx.reportAttachmentSuccess(file.fullpath);
 	}
 
-	async convertKeepJson(keepJson: KeepJson, folder: TFolder, filename: string) {
-		let mdContent: string[] = [];
-
-		// First let's gather some metadata
-		let frontMatter: FrontMatterCache = {};
-
-		// Aliases
-		if (keepJson.title) {
-			let aliases = keepJson.title.split('\n').filter(a => a !== filename);
-
-			if (aliases.length > 0) {
-				frontMatter['aliases'] = aliases;
-			}
-		}
-
-		let tags: string[] = [];
-		// Add in tags to represent Keep properties
-		if (keepJson.color && keepJson.color !== 'DEFAULT') {
-			let colorName = keepJson.color.toLowerCase();
-			colorName = toSentenceCase(colorName);
-			tags.push(`Keep/Color/${colorName}`);
-		}
-		if (keepJson.isPinned) tags.push('Keep/Pinned');
-		if (keepJson.attachments) tags.push('Keep/Attachment');
-		if (keepJson.isArchived) tags.push('Keep/Archived');
-		if (keepJson.isTrashed) tags.push('Keep/Deleted');
-		if (keepJson.labels) {
-			for (let label of keepJson.labels) {
-				tags.push(`Keep/Label/${label.name}`);
-			}
-		}
-
-		if (tags.length > 0) {
-			frontMatter['tags'] = tags.map(tag => sanitizeTag(tag));
-		}
-
-		mdContent.push(serializeFrontMatter(frontMatter));
-
-		// Actual content
-
-		if (keepJson.textContent) {
-			mdContent.push('\n');
-			mdContent.push(sanitizeTags(keepJson.textContent));
-		}
-
-		if (keepJson.listContent) {
-			let mdListContent = [];
-			for (const listItem of keepJson.listContent) {
-				// Don't put in blank checkbox items
-				if (!listItem.text) continue;
-
-				let listItemContent = `- [${listItem.isChecked ? 'X' : ' '}] ${listItem.text}`;
-				mdListContent.push(sanitizeTags(listItemContent));
-			}
-
-			mdContent.push('\n\n');
-			mdContent.push(mdListContent.join('\n'));
-		}
-
-		if (keepJson.attachments) {
-			mdContent.push('\n\n');
-			for (const attachment of keepJson.attachments) {
-				mdContent.push(`![[${attachment.filePath}]]`);
-			}
-		}
-
-		const file = await this.saveAsMarkdownFile(folder, filename, mdContent.join(''));
-
-		// Modifying the creation and modified timestamps without changing file contents.
-		await this.vault.append(file, '', {
-			ctime: keepJson.createdTimestampUsec / 1000,
-			mtime: keepJson.userEditedTimestampUsec / 1000,
+	async convertKeepJson(ctx: ImportContext, keepJson: KeepJson, folder: TFolder, filename: string): Promise<NoteWritten> {
+		const strictLineBreaks = this.vault.getConfig('strictLineBreaks') === true;
+		const { content, ctime, mtime } = convertKeepNote(
+			keepJson,
+			filename,
+			strictLineBreaks,
+			sourcePath => this.attachmentPaths.get(sourcePath) ?? this.attachmentPaths.get(sourcePath.split('/').pop() ?? '') ?? sourcePath
+		);
+		return await this.writeNote(ctx, folder, filename, content, {
+			ctime,
+			mtime,
+			templateVariables: keepTemplateVariables(keepJson),
 		});
 	}
 }

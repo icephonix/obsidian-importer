@@ -1,4 +1,4 @@
-import type { Moment } from 'moment';
+import { moment } from 'obsidian';
 import { parseFilePath } from '../../filesystem';
 
 export const stripNotionId = (id: string) => {
@@ -18,7 +18,7 @@ export const parseParentIds = (filename: string) => {
 		.filter((id) => id) as string[];
 };
 
-export function parseDate(content: Moment) {
+export function parseDate(content: moment.Moment) {
 	if (content.hour() === 0 && content.minute() === 0) {
 		return content.format('YYYY-MM-DD');
 	}
@@ -52,7 +52,7 @@ export function stripParentDirectories(relativeURI: string) {
  * @todo Currently cannot ignore #s in multine code/math blocks as this function parses one line at a time.
  */
 export function escapeHashtags(body: string) {
-	const tagExp = /#\d*?(?:[-_/a-z]|[^\x00-\x7F])/gi;
+	const tagExp = /#\d*?(?:[-_/a-z]|\P{ASCII})/giu;
 
 	if (!tagExp.test(body)) return body;
 	const lines = body.split('\n');

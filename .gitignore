@@ -7,7 +7,8 @@
 
 # npm
 node_modules
-pnpm-lock.yaml
+# This project uses pnpm
+package-lock.json
 
 # Don't include the compiled main.js file in the repo.
 # They should be uploaded to GitHub releases instead.
@@ -25,3 +26,15 @@ data.json
 # Exclude files specific to personal development process
 .hotreload
 .devtarget
+.env
+/context
+# Local Claude Code settings, and the worktrees it checks out here
+.claude/
+
+# Conversion fixtures that cannot be committed - a user's export attached to an
+# issue, typically. Drop one in tests/<importer>/local/ and its output is
+# recorded beside it. See tests/helpers.ts.
+tests/**/local/
+
+# Website build output
+/web/dist

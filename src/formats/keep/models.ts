@@ -1,5 +1,6 @@
 export interface KeepListItem {
-	text: string;
+	text?: string;
+	textHtml?: string;
 	isChecked: boolean;
 }
 
@@ -18,6 +19,17 @@ export interface KeepLabel {
 	name: string;
 }
 
+export interface KeepTask {
+	id: string;
+}
+
+export interface KeepAnnotation {
+	description?: string;
+	source?: string;
+	title?: string;
+	url?: string;
+}
+
 export interface KeepJson {
 	createdTimestampUsec: number;
 	userEditedTimestampUsec: number;
@@ -28,10 +40,27 @@ export interface KeepJson {
 	//
 	title?: string;
 	textContent?: string;
+	textContentHtml?: string;
 	listContent?: KeepListItem[];
 	attachments?: KeepAttachment[];
 	//
 	color?: string;
 	labels?: KeepLabel[];
 	sharees?: KeepSharee[];
+	tasks?: KeepTask[];
+	annotations?: KeepAnnotation[];
+}
+
+function isFiniteNumber(value: unknown): value is number {
+	return typeof value === 'number' && Number.isFinite(value);
+}
+
+export function hasValidKeepTimestamps(value: unknown): value is KeepJson {
+	if (typeof value !== 'object' || value === null) return false;
+
+	const note = value as Partial<KeepJson>;
+	return isFiniteNumber(note.createdTimestampUsec)
+		&& note.createdTimestampUsec > 0
+		&& isFiniteNumber(note.userEditedTimestampUsec)
+		&& note.userEditedTimestampUsec >= 0;
 }

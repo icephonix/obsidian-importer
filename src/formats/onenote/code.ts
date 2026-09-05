@@ -10,9 +10,12 @@ function isCode(node: Node|null): node is HTMLElement {
  * Return true iff node is a paragraph containing only code/line breaks
  */
 export function isParagraphWrappingOnlyCode(node: Node|null): node is HTMLParagraphElement {
+	// nodeName, not instanceof: linkedom does not specialise <p>, so the test
+	// shim would silently return false and the recording would still pass.
 	return (
 		node != null
-		&& node instanceof HTMLParagraphElement
+		&& node.nodeName === 'P'
+		&& node.childNodes.length > 0
 		&& Array.from(node.childNodes)
 			.every(c => isCode(c) || isBRElement(c))
 	);
@@ -39,7 +42,7 @@ export function isFenceCodeBlock(node: Node): node is HTMLElement {
 }
 
 export function isBRElement(node: Node | null): node is HTMLBRElement {
-	return node instanceof HTMLBRElement;
+	return node != null && node.nodeName === 'BR';
 }
 
 export function getSiblingsInSameCodeBlock(element: Element): Element[] {

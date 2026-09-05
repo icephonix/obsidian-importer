@@ -1,3 +1,5 @@
+export const NOTION_VERSION = '2025-09-03';
+
 /**
  * Type definitions for Notion API importer
  */
@@ -5,14 +7,26 @@
 import {
 	Client,
 	BlockObjectResponse,
+	DataSourceObjectResponse,
 	PageObjectResponse,
-	Heading1BlockObjectResponse,
-	Heading2BlockObjectResponse,
-	Heading3BlockObjectResponse
+	Heading1BlockObjectResponse
 } from '@notionhq/client';
 import { Vault, App } from 'obsidian';
-import { ImportContext } from '../../main';
-import type { FormulaImportStrategy } from '../notion-api';
+import { ImportContext } from '../../import-context';
+import type { FormulaImportStrategy } from '../../base';
+
+export type NotionPropertyConfig =
+	| DataSourceObjectResponse['properties'][string]
+	| { type: 'button' | 'place', id: string, name: string, description: string | null };
+
+export type NotionProperties = Record<string, NotionPropertyConfig>;
+
+export interface BasePropertyMapping {
+	displayName: string;
+	formula?: string;
+	isRelation?: boolean;
+	relationConfig?: unknown;
+}
 
 /**
  * Configuration context for database processing operations
@@ -29,10 +43,39 @@ export interface DatabaseProcessingContext {
 	formulaStrategy: FormulaImportStrategy;
 	processedDatabases: Map<string, DatabaseInfo>;
 	relationPlaceholders: RelationPlaceholder[];
-	importPageCallback: (pageId: string, parentPath: string, databaseTag?: string, customFileName?: string) => Promise<void>;
-	onPagesDiscovered?: (count: number) => void;
+	importPageCallback: (
+		pageId: string,
+		parentPath: string,
+		databaseTag?: string,
+		customFileName?: string,
+		page?: PageObjectResponse,
+		blocks?: Promise<BlockObjectResponse[]>,
+	) => Promise<void>;
+	onPagesDiscovered?: (pageIds: string[]) => void;
+	onBaseFileWritten?: (path: string) => void;
 	databasePropertyName?: string; // Property name for linking pages to their database .base file
 	blocksCache?: Map<string, BlockObjectResponse[]>; // Cache of fetched blocks for recursive search
+}
+
+/** What the converter has to say about a synced block's own note. */
+export interface SyncedBlockRequest {
+	blockId: string;
+	folderPath: string;
+	fileName: string;
+	/** When Notion made and last changed the block, for deciding staleness. */
+	createdTime?: string;
+	lastEditedTime?: string;
+	convert: (filePath: string, options: SyncedBlockConversion) => Promise<string>;
+}
+
+export interface SyncedBlockConversion {
+	/** Walking it for what is under it, so nothing it points at is fetched. */
+	forChildrenOnly: boolean;
+	/**
+	 * Recording unresolved placeholders is what has the file rewritten once the
+	 * import is done, which a note the user has edited must not be.
+	 */
+	keepPlaceholders: boolean;
 }
 
 /**
@@ -43,9 +86,7 @@ export interface DatabaseInfo {
 	title: string;
 	folderPath: string;
 	baseFilePath: string;
-	// Using 'any' because database properties have many different types and configurations
-	// (text, number, select, formula, relation, rollup, etc.) with varying structures.
-	properties: Record<string, any>;
+	properties: NotionProperties;
 	dataSourceId: string;
 }
 
@@ -57,7 +98,7 @@ export interface DatabaseImportResult {
 	baseFilePath: string;
 	databasePages: PageObjectResponse[];
 	dataSourceId: string;
-	dataSourceProperties: Record<string, any>;
+	dataSourceProperties: NotionProperties;
 }
 
 /**
@@ -107,7 +148,8 @@ export interface RollupConfig {
 
 	// Note: Numeric aggregation functions (sum, average, median, min, max, range)
 	// are not yet implemented and will fall through to the default case
-	| string;              // Allow other values for forward compatibility
+	// Preserve autocomplete for known values while accepting new Notion types.
+	| (string & {});
 }
 
 /**
@@ -119,14 +161,15 @@ export interface FetchAndImportPageParams {
 	parentPath: string;
 	databaseTag?: string;
 	customFileName?: string; // Custom file name (without .md extension) to override the page title
+	page?: PageObjectResponse;
+	blocks?: Promise<BlockObjectResponse[]>;
 }
 
 export interface CreateBaseFileParams {
 	vault: Vault;
 	databaseName: string;
 	databaseFolderPath: string;
-	// Using 'any' because Notion database property schema has many variants with different structures
-	dataSourceProperties: Record<string, any>;
+	dataSourceProperties: NotionProperties;
 	formulaStrategy?: FormulaImportStrategy;
 	databasePropertyName?: string; // Property name for linking pages to database
 }
@@ -136,8 +179,7 @@ export interface CreateBaseFileParams {
  */
 export interface GenerateBaseFileContentParams {
 	databaseName: string;
-	// Using 'any' because Notion database property schema has many variants with different structures
-	dataSourceProperties: Record<string, any>;
+	dataSourceProperties: NotionProperties;
 	formulaStrategy?: FormulaImportStrategy;
 	databasePropertyName?: string; // Property name for linking pages to database
 }
@@ -191,13 +233,7 @@ export interface FormatAttachmentLinkParams {
  */
 export type ImportPageCallback = (pageId: string, parentPath: string) => Promise<void>;
 
-/**
- * Common type for heading content with rich text and color
- */
-export type HeaderContentWithRichTextAndColorResponse =
-	Heading1BlockObjectResponse['heading_1'] |
-	Heading2BlockObjectResponse['heading_2'] |
-	Heading3BlockObjectResponse['heading_3'];
+export type HeaderContentWithRichTextAndColorResponse = Heading1BlockObjectResponse['heading_1'];
 
 /**
  * Context for block conversion operations
@@ -211,7 +247,14 @@ export interface BlockConversionContext {
 	app: App;
 	downloadExternalAttachments: boolean;
 	singleLineBreaks?: boolean; // Single line breaks between blocks (default: false)
-	incrementalImport?: boolean; // Skip downloading attachments if same path and size
+	reuseExistingAttachments?: boolean;
+	/**
+	 * This page is being walked to reach what is under it, not to be written.
+	 * Its child pages and databases are still imported, but the markdown is
+	 * thrown away, so nothing it points at is worth fetching.
+	 */
+	forChildrenOnly?: boolean;
+	rangeProbe?: { answered: boolean };
 	indentLevel?: number;
 	blocksCache?: Map<string, BlockObjectResponse[]>;
 	importPageCallback?: ImportPageCallback;
@@ -221,10 +264,18 @@ export interface BlockConversionContext {
 	syncedChildPagePlaceholders?: Map<string, Set<string>>; // Map file path to synced child page IDs
 	syncedChildDatabasePlaceholders?: Map<string, Set<string>>; // Map file path to synced child database IDs
 	listCounters?: Map<number, number>; // Track list item numbers per indent level
-	onAttachmentDownloaded?: () => void; // Callback when an attachment is downloaded
+	onAttachmentDownloaded?: (filename: string) => void;
 	currentPageTitle?: string; // Current page title for attachment naming fallback
 	isProcessingSyncedBlock?: boolean; // Flag to indicate we're processing synced block content
 	getAvailableAttachmentPath?: (filename: string) => Promise<string>; // Function to get available attachment path
+	/**
+	 * Place, convert and write a synced block's own note, and say where it went.
+	 *
+	 * The importer owns it because only it knows what the vault already holds.
+	 * Conversion happens inside, because the path it settles on is the one the
+	 * block's own links are generated against.
+	 */
+	syncedBlockFile?: (request: SyncedBlockRequest) => Promise<string>;
 }
 
 /**
@@ -239,6 +290,25 @@ export interface ConversionInfo {
 /**
  * Attachment type enum for type safety and consistency
  */
+/**
+ * Which kind of block a nested fetch was for, named so a failure can say. The
+ * set is closed on purpose: every one of these needs a label in the string
+ * table, and a new kind should not compile until it has one.
+ */
+export type BlockContext =
+	| 'paragraph'
+	| 'bulleted list item'
+	| 'numbered list item'
+	| 'to-do item'
+	| 'quote block'
+	| 'callout block'
+	| 'toggle block'
+	| 'toggleable heading'
+	| 'column'
+	| 'column_list'
+	| 'table'
+	| 'block';
+
 export enum AttachmentType {
 	IMAGE = 'image',
 	VIDEO = 'video',
@@ -255,4 +325,3 @@ export interface AttachmentBlockConfig {
 	fallbackText: string;
 	beforeDownload?: (attachment: NotionAttachment, block: any) => string | null;
 }
-

@@ -1,10 +1,17 @@
-import { Notice, Setting, ToggleComponent, DropdownComponent, Platform } from 'obsidian';
-import { FormatImporter } from '../format-importer';
-import { ImportContext } from '../main';
+import { Notice, TFolder, ToggleComponent, DropdownComponent, normalizePath, Platform } from 'obsidian';
+import { FormatImporter, NoteTemplateSample, NoteWritten, TEMPLATE_PREVIEW_LIMIT } from '../format-importer';
+import { ImportContext } from '../import-context';
+import { i18n } from '../i18n';
+import { PickedFile } from '../filesystem';
+import { sanitizeFileName } from '../util';
 import { TomboyCoreConverter, KeepTitleMode } from './tomboy/core';
 import { os, path } from '../filesystem';
 
 export class TomboyImporter extends FormatImporter {
+	static extensions = ['note'];
+
+	interruption = 'pause' as const;
+
 	private coreConverter: TomboyCoreConverter;
 	private todoEnabled: boolean;
 	private keepTitleMode: KeepTitleMode;
@@ -43,15 +50,15 @@ export class TomboyImporter extends FormatImporter {
 	 */
 	private getOSSpecificDescription(): string {
 		if (Platform.isMacOS) {
-			return 'Tomboy notes are typically found in: ~/Library/Application Support/Tomboy';
+			return i18n.importer.tomboy.descFilesMac();
 		}
 		else if (Platform.isWin) {
-			return 'Tomboy notes are typically found in: %APPDATA%\\Tomboy';
+			return i18n.importer.tomboy.descFilesWindows();
 		}
 		else if (Platform.isLinux) {
-			return 'Tomboy notes are typically found in: ~/.local/share/tomboy - or GNote: ~/.local/share/gnote';
+			return i18n.importer.tomboy.descFilesLinux();
 		}
-		return 'Pick the files that you want to import.';
+		return i18n.source.desc();
 	}
 
 	init() {
@@ -59,24 +66,26 @@ export class TomboyImporter extends FormatImporter {
 		this.coreConverter = new TomboyCoreConverter();
 		this.keepTitleMode = 'automatic';
 
-		this.addFileChooserSetting('Tomboy/Gnote', ['note'], true, this.getOSSpecificDescription(), this.getDefaultTomboyPath());
-		this.addOutputLocationSetting('Tomboy');
+		this.addFileChooserSetting(i18n.importer.tomboy.fileType(), TomboyImporter.extensions, true, this.getOSSpecificDescription(), this.getDefaultTomboyPath());
+		this.defaultOutputFolder = 'Tomboy';
+		this.idProperty = 'tomboy-id';
+		this.idLabel = i18n.importer.tomboy.labelId();
 
-		new Setting(this.modal.contentEl)
-			.setName('Convert TODO lists to checkboxes')
-			.setDesc('When enabled, lists in notes with "TODO" in the title will be converted to task lists with checkboxes. Strikethrough items will be marked as completed.')
+		this.addSetting()
+			?.setName(i18n.importer.tomboy.nameTodo())
+			.setDesc(i18n.importer.tomboy.descTodo())
 			.addToggle((toggle: ToggleComponent) => {
 				toggle.setValue(this.todoEnabled)
 					.onChange((value: boolean) => this.todoEnabled = value);
 			});
 
-		new Setting(this.modal.contentEl)
-			.setName('Keep title in Markdown')
-			.setDesc('Choose whether to keep the note title in the Markdown content. "Automatic" keeps titles only when special characters are lost in filename conversion.')
+		this.addSetting()
+			?.setName(i18n.importer.tomboy.nameKeepTitle())
+			.setDesc(i18n.importer.tomboy.descKeepTitle())
 			.addDropdown((dropdown: DropdownComponent) => {
-				dropdown.addOption('automatic', 'Automatic')
-					.addOption('yes', 'Keep titles')
-					.addOption('no', 'Filename only')
+				dropdown.addOption('automatic', i18n.importer.tomboy.optionAutomatic())
+					.addOption('yes', i18n.importer.tomboy.optionKeepTitles())
+					.addOption('no', i18n.importer.tomboy.optionFilenameOnly())
 					.setValue(this.keepTitleMode)
 					.onChange((value: string) => this.keepTitleMode = value as KeepTitleMode);
 			});
@@ -85,13 +94,13 @@ export class TomboyImporter extends FormatImporter {
 	async import(ctx: ImportContext): Promise<void> {
 		const { files } = this;
 		if (files.length === 0) {
-			new Notice('Please pick at least one file to import.');
+			new Notice(i18n.common.msgPickFile());
 			return;
 		}
 
 		const folder = await this.getOutputFolder();
 		if (!folder) {
-			new Notice('Please select a location to export to.');
+			new Notice(i18n.common.msgPickOutput());
 			return;
 		}
 
@@ -100,13 +109,13 @@ export class TomboyImporter extends FormatImporter {
 
 		ctx.reportProgress(0, files.length);
 		for (let i = 0; i < files.length; i++) {
-			if (ctx.isCancelled()) return;
+			if (await ctx.shouldStop()) return;
 
 			const file = files[i];
-			ctx.status('Processing ' + file.name);
+			ctx.status(i18n.common.statusProcessing({ name: file.name }));
 			try {
-				await this.processFile(ctx, folder, file);
-				ctx.reportNoteSuccess(file.fullpath);
+				const { written } = await this.processFile(ctx, folder, file);
+				if (written) ctx.reportNoteSuccess(file.fullpath);
 			}
 			catch (e) {
 				ctx.reportFailed(file.fullpath, e);
@@ -116,12 +125,46 @@ export class TomboyImporter extends FormatImporter {
 		}
 	}
 
-	private async processFile(ctx: ImportContext, folder: any, file: any): Promise<void> {
+	protected override async templatePreviewSamples(ctx: ImportContext): Promise<NoteTemplateSample[]> {
+		this.coreConverter.setTodoEnabled(this.todoEnabled);
+		this.coreConverter.setKeepTitleMode(this.keepTitleMode);
+		const samples: NoteTemplateSample[] = [];
+		for (const file of this.files) {
+			if (samples.length >= TEMPLATE_PREVIEW_LIMIT || await ctx.shouldStop()) break;
+			try {
+				const note = this.coreConverter.parseTomboyXML(await file.readText());
+				const times = {
+					ctime: note.createDate?.getTime(),
+					mtime: note.lastChangeDate?.getTime(),
+				};
+				samples.push({
+					title: note.title,
+					path: normalizePath([
+						this.outputLocation.trim(),
+						`${sanitizeFileName(note.title)}.md`,
+					].filter(Boolean).join('/')),
+					content: this.coreConverter.convertToMarkdown(note),
+					sourceId: file.basename,
+					times,
+				});
+			}
+			catch (error) {
+				console.warn(`Could not preview Tomboy file ${file.fullpath}`, error);
+			}
+		}
+		return samples;
+	}
+
+	private async processFile(ctx: ImportContext, folder: TFolder, file: PickedFile): Promise<NoteWritten> {
 		const xmlContent = await file.readText();
 
 		const tomboyNote = this.coreConverter.parseTomboyXML(xmlContent);
 		const markdownContent = this.coreConverter.convertToMarkdown(tomboyNote);
 
-		await this.saveAsMarkdownFile(folder, tomboyNote.title, markdownContent);
+		return await this.writeNote(ctx, folder, tomboyNote.title, markdownContent, {
+			sourceId: file.basename,
+			ctime: tomboyNote.createDate?.getTime(),
+			mtime: tomboyNote.lastChangeDate?.getTime(),
+		});
 	}
 }

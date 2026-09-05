@@ -12,12 +12,65 @@ import {
 	UserObjectResponse,
 	PartialBlockObjectResponse
 } from '@notionhq/client';
-import { ImportContext } from '../../main';
+import { App, FrontMatterCache, Vault } from 'obsidian';
+import { ImportContext } from '../../import-context';
+import { i18n } from '../../i18n';
+import { extractErrorMessage } from '../../util';
+
+const BLOCK_CONTEXT_LABELS: Record<BlockContext, () => string> = {
+	'paragraph': () => i18n.importer.notionApi.blockParagraph(),
+	'bulleted list item': () => i18n.importer.notionApi.blockBulletedListItem(),
+	'numbered list item': () => i18n.importer.notionApi.blockNumberedListItem(),
+	'to-do item': () => i18n.importer.notionApi.blockTodoItem(),
+	'quote block': () => i18n.importer.notionApi.blockQuote(),
+	'callout block': () => i18n.importer.notionApi.blockCallout(),
+	'toggle block': () => i18n.importer.notionApi.blockToggle(),
+	'toggleable heading': () => i18n.importer.notionApi.blockToggleableHeading(),
+	'column': () => i18n.importer.notionApi.blockColumn(),
+	'column_list': () => i18n.importer.notionApi.blockColumnList(),
+	'table': () => i18n.importer.notionApi.blockTable(),
+	'block': () => i18n.importer.notionApi.blockGeneric(),
+};
 import { canConvertFormula, getNotionFormulaExpression } from './formula-converter';
 import { downloadAndFormatAttachment } from './attachment-helpers';
-import { NotionAttachment } from './types';
+import { BlockContext, NotionAttachment } from './types';
+import { backOffBeforeRetry } from './utils';
 
 const MAX_RETRIES = 3;
+
+export interface NotionRequestError {
+	code?: string;
+	status?: number;
+	headers?: Record<string, string>;
+}
+
+const RETRYABLE_CODES = new Set([
+	'rate_limited',
+	'service_overload',
+	'internal_server_error',
+	'service_unavailable',
+	'gateway_timeout',
+	'notionhq_client_request_timeout',
+	'notionhq_client_response_error',
+]);
+
+// Some rendering timeouts use status 400 but explicitly request backoff.
+const ASKS_TO_RETRY = /retry with exponential backoff/i;
+
+function isRetryable(error: NotionRequestError): boolean {
+	if (error.status !== undefined && error.status >= 500) return true;
+	if (error.status === 429 || error.status === 408) return true;
+	if (error.code !== undefined && RETRYABLE_CODES.has(error.code)) return true;
+
+	return ASKS_TO_RETRY.test(extractErrorMessage(error) ?? '');
+}
+
+function retryDelay(error: NotionRequestError, retryCount: number): number {
+	const retryAfter = error.headers?.['retry-after'] ?? error.headers?.['Retry-After'];
+	const asked = retryAfter ? Number.parseInt(retryAfter, 10) : NaN;
+
+	return Number.isFinite(asked) && asked > 0 ? asked : Math.pow(2, retryCount);
+}
 
 /**
  * Get children blocks for a block, using cache if available
@@ -60,7 +113,7 @@ export interface ProcessBlockChildrenParams<T> {
 	ctx: ImportContext;
 	blocksCache?: Map<string, BlockObjectResponse[]>;
 	processor: (children: BlockObjectResponse[]) => Promise<T> | T;
-	errorContext?: string;
+	errorContext?: BlockContext;
 }
 
 /**
@@ -95,18 +148,20 @@ export async function processBlockChildren<T>(
 		return await processor(children);
 	}
 	catch (error) {
-		const context = errorContext || 'block';
+		const context: BlockContext = errorContext || 'block';
 		const errorMsg = error instanceof Error ? error.message : String(error);
 		console.error(`Failed to fetch children for ${context} ${block.id}:`, error);
-		ctx.reportFailed(`Fetch children for ${context} ${block.id}`, errorMsg);
+		ctx.reportFailed(
+			i18n.importer.notionApi.labelFetchChildren({
+				context: BLOCK_CONTEXT_LABELS[context](),
+				id: block.id,
+			}),
+			errorMsg
+		);
 		return undefined;
 	}
 }
 
-/**
- * Wrapper for Notion API calls with rate limit handling
- * Automatically retries on 429 errors with exponential backoff
- */
 export async function makeNotionRequest<T>(
 	requestFn: () => Promise<T>,
 	ctx: ImportContext,
@@ -115,38 +170,38 @@ export async function makeNotionRequest<T>(
 	try {
 		return await requestFn();
 	}
-	// Using 'any' for error because we need to access error.code and error.status properties
-	// which may or may not exist depending on the error type (Notion API error vs generic error).
-	catch (error: any) {
-		// Handle rate limiting (429 error)
-		if (error.code === 'rate_limited' || error.status === 429) {
-			if (retryCount >= MAX_RETRIES) {
-				throw new Error(`Rate limit exceeded after ${MAX_RETRIES} retries`);
-			}
+	catch (e) {
+		const error = e as NotionRequestError;
+		if (!isRetryable(error)) throw e;
 
-			// Get retry delay from Retry-After header or use exponential backoff
-			let retryAfter = 1;
-			if (error.headers && error.headers['retry-after']) {
-				retryAfter = parseInt(error.headers['retry-after'], 10);
-			}
-			else {
-				// Exponential backoff: 1s, 2s, 4s
-				retryAfter = Math.pow(2, retryCount);
-			}
+		const rateLimited = error.code === 'rate_limited' || error.status === 429;
 
-			const previousStatus = ctx.statusMessage;
-			ctx.status(`Rate limited. Waiting ${retryAfter} seconds before retry (${retryCount + 1}/${MAX_RETRIES})...`);
-
-			await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-
-			ctx.status(previousStatus);
-
-			// Retry the request
-			return makeNotionRequest(requestFn, ctx, retryCount + 1);
+		if (retryCount >= MAX_RETRIES) {
+			throw new Error(rateLimited
+				? i18n.importer.notionApi.reasonRateLimitGaveUp({ retries: MAX_RETRIES })
+				: i18n.importer.notionApi.reasonGaveUp({
+					reason: extractErrorMessage(e) ?? String(error.status ?? error.code),
+					retries: MAX_RETRIES,
+				}));
 		}
 
-		// Re-throw other errors
-		throw error;
+		const waitFor = retryDelay(error, retryCount);
+		const waiting = rateLimited
+			? i18n.importer.notionApi.statusRateLimited({
+				seconds: waitFor,
+				attempt: retryCount + 1,
+				total: MAX_RETRIES,
+			})
+			: i18n.importer.notionApi.statusRetrying({
+				status: String(error.status ?? error.code),
+				seconds: waitFor,
+				attempt: retryCount + 1,
+				total: MAX_RETRIES,
+			});
+
+		if (!await backOffBeforeRetry(ctx, waitFor, waiting)) throw e;
+
+		return makeNotionRequest(requestFn, ctx, retryCount + 1);
 	}
 }
 
@@ -162,9 +217,7 @@ export async function fetchAllBlocks(
 	let cursor: string | undefined = undefined;
 
 	do {
-		// Using 'any' for response because Notion API returns a paginated response with complex structure
-		// and we only need to access .results, .has_more, and .next_cursor properties.
-		const response: any = await makeNotionRequest(
+		const response = await makeNotionRequest(
 			() => client.blocks.children.list({
 				block_id: blockId,
 				start_cursor: cursor,
@@ -247,7 +300,7 @@ export async function hasChildPagesOrDatabases(
 			catch (error) {
 				const errorMsg = error instanceof Error ? error.message : String(error);
 				console.error(`Failed to fetch children for block ${block.id}:`, error);
-				ctx.reportFailed(`Fetch children for block ${block.id}`, errorMsg);
+				ctx.reportFailed(i18n.importer.notionApi.labelFetchChildrenBlock({ id: block.id }), errorMsg);
 				// Continue checking other blocks even if one fails
 			}
 		}
@@ -290,13 +343,13 @@ export interface ExtractFrontMatterParams {
 	client?: Client;
 	ctx?: ImportContext;
 	// Parameters for downloading file attachments
-	vault?: any;
-	app?: any;
+	vault?: Vault;
+	app?: App;
 	currentFilePath?: string;
 	currentFolderPath?: string;
 	downloadExternalAttachments?: boolean;
-	incrementalImport?: boolean;
-	onAttachmentDownloaded?: () => void;
+	reuseExistingAttachments?: boolean;
+	onAttachmentDownloaded?: (filename: string) => void;
 	getAvailableAttachmentPath?: (filename: string) => Promise<string>;
 }
 
@@ -307,7 +360,7 @@ export interface ExtractFrontMatterParams {
  */
 export async function extractFrontMatter(
 	params: ExtractFrontMatterParams
-): Promise<Record<string, any>> {
+): Promise<FrontMatterCache> {
 	const {
 		page,
 		formulaStrategy = 'hybrid',
@@ -316,7 +369,7 @@ export async function extractFrontMatter(
 		ctx
 	} = params;
 	// Using 'any' for frontMatter values because page properties have many different types
-	const frontMatter: Record<string, any> = {
+	const frontMatter: FrontMatterCache = {
 		'notion-id': page.id,
 	};
 
@@ -514,7 +567,7 @@ async function mapFilesPropertyToFrontmatter(
 		return null;
 	}
 
-	const { vault, app, ctx, currentFilePath, currentFolderPath, incrementalImport, onAttachmentDownloaded, getAvailableAttachmentPath } = params;
+	const { vault, app, ctx, currentFilePath, currentFolderPath, reuseExistingAttachments, onAttachmentDownloaded, getAvailableAttachmentPath } = params;
 
 	if (!vault || !app || !ctx) {
 		// Fallback to URL if we don't have required parameters
@@ -561,7 +614,7 @@ async function mapFilesPropertyToFrontmatter(
 					currentFilePath,
 					currentFolderPath,
 					downloadExternalAttachments: true,  // Always download files property attachments
-					incrementalImport: incrementalImport || false,
+					reuseExistingAttachments: reuseExistingAttachments || false,
 					onAttachmentDownloaded,
 					getAvailableAttachmentPath
 				},
@@ -630,7 +683,7 @@ function convertNotionDateToObsidian(dateString: string): string {
  *               and TypeScript cannot properly narrow types in the switch statement
  * @returns Using 'any' because the return value type depends on the property type
  */
-function mapNotionPropertyToFrontmatter(prop: any): any {
+export function mapNotionPropertyToFrontmatter(prop: any): any {
 	switch (prop.type) {
 		case 'number':
 			return prop.number;
@@ -647,7 +700,7 @@ function mapNotionPropertyToFrontmatter(prop: any): any {
 		case 'status':
 			return prop.status?.name || null;
 
-		case 'date':
+		case 'date': {
 			if (!prop.date) return null;
 			// Convert Notion date format (ISO 8601) to Obsidian format
 			// Date only: YYYY-MM-DD (keep as is)
@@ -659,6 +712,7 @@ function mapNotionPropertyToFrontmatter(prop: any): any {
 				return `${startDate} to ${endDate}`;
 			}
 			return startDate;
+		}
 
 		case 'email':
 			return prop.email;
@@ -691,7 +745,7 @@ function mapNotionPropertyToFrontmatter(prop: any): any {
 				return '';
 			}).filter((url: string) => url) || [];
 
-		case 'formula':
+		case 'formula': {
 			// Extract formula result value
 			if (!prop.formula) return null;
 			const formulaResult = prop.formula;
@@ -707,6 +761,7 @@ function mapNotionPropertyToFrontmatter(prop: any): any {
 				default:
 					return null;
 			}
+		}
 
 		case 'relation':
 			// Relation properties contain page IDs
@@ -770,4 +825,3 @@ function mapNotionPropertyToFrontmatter(prop: any): any {
 			return String(prop[prop.type] || '');
 	}
 }
-

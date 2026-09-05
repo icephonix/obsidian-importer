@@ -1,45 +1,31 @@
-import { path } from './filesystem';
-import { TFolder, TFile, BasesConfigFile, stringifyYaml, normalizePath } from 'obsidian';
+import { TFolder, TFile, BasesConfigFile, stringifyYaml, normalizePath, Vault } from 'obsidian';
 
 /**
- * Creates a Base file in the specified folder.
- * 
- * @param folder - The folder to create the Base file in
- * @param fileName - Name of the Base file (without .base extension)
- * @param options - Configuration for the Base file content
- * @param vault - Obsidian vault instance
- * @returns The created TFile
- * 
- * @example
- * ```ts
- * await createBaseFile(folder, 'CSV import', {
- *   filters: 'file.folder == "CSV import"',
- *   views: [{
- *     type: 'table',
- *     name: 'Table',
- *     order: ['file.name', 'title', 'date', 'category']
- *   }]
- * }, this.app.vault);
- * ```
+ * How an importer treats a source database's computed fields (formulas, rollups,
+ * lookups, counts).
+ *
+ * 'static' writes the value the source last computed into each note. 'hybrid'
+ * translates the expression into a Base formula where it can, so the values stay
+ * live, and falls back to the static value where it cannot.
  */
+export type FormulaImportStrategy = 'static' | 'hybrid';
+
+/** Creates or replaces a Base configuration file. */
 export async function createBaseFile(
 	folder: TFolder,
 	fileName: string,
 	contents: BasesConfigFile,
-	vault: any
+	vault: Vault
 ): Promise<TFile> {
 	const yamlContent = stringifyYaml(contents);
-	const filePath = normalizePath(path.join(folder.path, fileName + '.base'));
+	// Node's path module is unavailable on mobile.
+	const filePath = normalizePath(`${folder.path}/${fileName}.base`);
 
-	// Check if file already exists
 	const existingFile = vault.getAbstractFileByPath(filePath);
 	if (existingFile instanceof TFile) {
-		// Update existing file
 		await vault.modify(existingFile, yamlContent);
 		return existingFile;
 	}
 
-	// Create new file
 	return await vault.create(filePath, yamlContent);
 }
-
